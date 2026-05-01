@@ -2059,6 +2059,17 @@ def render_metric_row(state: DesignState, results: Dict[str, Any]):
     c5.metric("Max pile R", f"{max(p.reaction_kN for p in state.piles):.0f} kN")
 
 
+
+def format_display_dataframe(df: pd.DataFrame, formats: Dict[str, str]) -> pd.DataFrame:
+    display = df.copy()
+    for col, pattern in formats.items():
+        if col in display.columns:
+            display[col] = display[col].map(
+                lambda value, p=pattern: p.format(value) if isinstance(value, (int, float, np.floating)) and np.isfinite(value) else value
+            )
+    return display
+
+
 def render_check_cards(checks: List[CheckResult]):
     df = checks_to_dataframe(checks)
     def color_status(val):
@@ -2070,8 +2081,10 @@ def render_check_cards(checks: List[CheckResult]):
             return "background-color: rgba(255,70,70,0.18)"
         return ""
 
+    display_df = format_display_dataframe(df, {"Demand": "{:,.2f}", "Capacity": "{:,.2f}", "Ratio": "{:.3f}"})
+
     st.dataframe(
-        df.style.format({"Demand": "{:,.2f}", "Capacity": "{:,.2f}", "Ratio": "{:.3f}"}).applymap(color_status, subset=["Status"]),
+        display_df,
         use_container_width=True,
         hide_index=True,
     )
@@ -2111,7 +2124,8 @@ def render_design_summary(state: DesignState, results: Dict[str, Any]):
             ]
         )
         st.dataframe(
-            summary.style.format(
+            format_display_dataframe(
+                summary,
                 {
                     "Required As (mm²)": "{:,.0f}",
                     "Strength As (mm²)": "{:,.0f}",
@@ -2119,7 +2133,7 @@ def render_design_summary(state: DesignState, results: Dict[str, Any]):
                     "Use spacing (mm)": "{:,.0f}",
                     "Provided As (mm²)": "{:,.0f}",
                     "φMn (kN-m)": "{:,.1f}",
-                }
+                },
             ),
             use_container_width=True,
             hide_index=True,
@@ -2141,7 +2155,7 @@ def render_design_summary(state: DesignState, results: Dict[str, Any]):
                 {"Item": "STM tie As advisory Y bars", "Value": results["As_stm_y_mm2"], "Unit": "mm²"},
             ]
         )
-        st.dataframe(detail.style.format({"Value": "{:,.1f}"}), use_container_width=True, hide_index=True)
+        st.dataframe(format_display_dataframe(detail, {"Value": "{:,.1f}"}), use_container_width=True, hide_index=True)
 
 
 def render_engineering_notes(results: Dict[str, Any]):
@@ -2273,14 +2287,15 @@ def main():
         with c1:
             st.markdown("#### Pile reactions")
             st.dataframe(
-                pile_group_result_table(state.piles, geom).style.format(
+                format_display_dataframe(
+                    pile_group_result_table(state.piles, geom),
                     {
                         "x (mm)": "{:,.0f}",
                         "y (mm)": "{:,.0f}",
                         "R, compression + (kN)": "{:,.1f}",
                         "Compression ratio": "{:.3f}",
                         "Tension ratio": "{:.3f}",
-                    }
+                    },
                 ),
                 use_container_width=True,
                 hide_index=True,
@@ -2297,7 +2312,7 @@ def main():
                     {"Item": "Effective depth Y bars", "Value": state.effective_depth_y_mm, "Unit": "mm"},
                 ]
             )
-            st.dataframe(dim_df.style.format({"Value": "{:,.1f}"}), use_container_width=True, hide_index=True)
+            st.dataframe(format_display_dataframe(dim_df, {"Value": "{:,.1f}"}), use_container_width=True, hide_index=True)
 
     # Use latest state/results even when user opens other tabs first.
     if "last_state_runtime" not in st.session_state:
@@ -2403,7 +2418,8 @@ def main():
 
         stm_df = results["stm"].copy()
         st.dataframe(
-            stm_df.style.format(
+            format_display_dataframe(
+                stm_df,
                 {
                     "R (kN)": "{:,.1f}",
                     "a horizontal (mm)": "{:,.0f}",
@@ -2411,7 +2427,7 @@ def main():
                     "T tie estimate (kN)": "{:,.1f}",
                     "Tx component (kN)": "{:,.1f}",
                     "Ty component (kN)": "{:,.1f}",
-                }
+                },
             ),
             use_container_width=True,
             hide_index=True,
