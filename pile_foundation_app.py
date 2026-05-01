@@ -1527,6 +1527,26 @@ def checks_to_dataframe(checks: List[CheckResult]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+def dataframe_to_markdown_table(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return "_No rows._"
+
+    display = df.copy()
+    for col in display.columns:
+        display[col] = display[col].map(lambda value: fmt(value, 3) if isinstance(value, float) else str(value))
+
+    columns = [str(col) for col in display.columns]
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join(["---"] * len(columns)) + " |",
+    ]
+    for _, row in display.iterrows():
+        values = [str(row[col]).replace("\n", " ").replace("|", "\\|") for col in display.columns]
+        lines.append("| " + " | ".join(values) + " |")
+    return "\n".join(lines)
+
+
 def make_markdown_report(state: DesignState, results: Dict[str, Any]) -> str:
     checks_df = checks_to_dataframe(results["checks"])
     pile_df = pile_group_result_table(state.piles, state.geometry)
@@ -1570,13 +1590,13 @@ def make_markdown_report(state: DesignState, results: Dict[str, Any]) -> str:
     lines.append(f"- Development estimate Y bars = {results['ld_y_mm']:.0f} mm")
     lines.append("")
     lines.append("## Check Summary")
-    lines.append(checks_df.to_markdown(index=False))
+    lines.append(dataframe_to_markdown_table(checks_df))
     lines.append("")
     lines.append("## Pile Reaction Table")
-    lines.append(pile_df.to_markdown(index=False))
+    lines.append(dataframe_to_markdown_table(pile_df))
     lines.append("")
     lines.append("## STM Advisory")
-    lines.append(stm_df.to_markdown(index=False))
+    lines.append(dataframe_to_markdown_table(stm_df))
     lines.append("")
     lines.append("## Notes")
     lines.append("- Verify ACI 318-25 clauses directly for final design.")
