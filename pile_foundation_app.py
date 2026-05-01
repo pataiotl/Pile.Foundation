@@ -101,6 +101,8 @@ ACI_REFERENCES = {
     "stm": "MacGregor-style practical load-path/strut-and-tie advisory for deep pile caps; not a substitute for full STM.",
 }
 
+PILE_LAYOUT_TEMPLATE_VERSION = "reference-arrangements-2026-05"
+
 
 # =============================================================================
 # STYLING
@@ -357,31 +359,50 @@ def get_session_default(key: str, value: Any) -> Any:
 
 def template_layout(n: int, sx: float, sy: float) -> List[Tuple[float, float]]:
     """
-    Auto-generate practical pile coordinates around centroid.
+    Auto-generate pile coordinates around centroid using the reference
+    arrangement sketches.
 
     Coordinates:
         x positive to right, y positive upward in plan.
         Units: mm.
+
+    The typical spacing inputs represent the 3D center-to-center spacing shown
+    in the reference sketches. Layouts with diagonal/triangular geometry derive
+    their offsets from that spacing with sqrt(2) or sqrt(3) factors.
     """
     if n < 2 or n > 12:
         raise ValueError("n_piles must be between 2 and 12")
 
-    # Many offices use these practical templates. User can edit after generation.
+    rt2 = math.sqrt(2.0)
+    rt3 = math.sqrt(3.0)
+
+    # Reference templates from the attached pile arrangement sketches. User can
+    # still edit the generated coordinates before running the design.
     templates: Dict[int, List[Tuple[float, float]]] = {
-        2: [(-0.5 * sx, 0.0), (0.5 * sx, 0.0)],
-        3: [(-0.5 * sx, -0.35 * sy), (0.5 * sx, -0.35 * sy), (0.0, 0.55 * sy)],
+        # 2 piles: vertical pair.
+        2: [(0.0, -0.5 * sy), (0.0, 0.5 * sy)],
+        # 3 piles: equilateral triangle, centered at its centroid.
+        3: [(-0.5 * sx, -rt3 * sy / 6.0), (0.5 * sx, -rt3 * sy / 6.0), (0.0, rt3 * sy / 3.0)],
         4: [(-0.5 * sx, -0.5 * sy), (0.5 * sx, -0.5 * sy), (-0.5 * sx, 0.5 * sy), (0.5 * sx, 0.5 * sy)],
-        5: [(-sx, -0.5 * sy), (0.0, -0.5 * sy), (sx, -0.5 * sy), (-0.5 * sx, 0.5 * sy), (0.5 * sx, 0.5 * sy)],
+        # 5 piles: four corner piles plus one center pile; corner spacing is 3*sqrt(2)D.
+        5: [(-sx / rt2, -sy / rt2), (sx / rt2, -sy / rt2), (0.0, 0.0), (-sx / rt2, sy / rt2), (sx / rt2, sy / rt2)],
         6: [(-sx, -0.5 * sy), (0.0, -0.5 * sy), (sx, -0.5 * sy), (-sx, 0.5 * sy), (0.0, 0.5 * sy), (sx, 0.5 * sy)],
-        7: [(-sx, -sy), (0.0, -sy), (sx, -sy), (-sx, 0.0), (0.0, 0.0), (sx, 0.0), (0.0, sy)],
-        8: [(-1.5 * sx, -0.5 * sy), (-0.5 * sx, -0.5 * sy), (0.5 * sx, -0.5 * sy), (1.5 * sx, -0.5 * sy),
-            (-1.5 * sx, 0.5 * sy), (-0.5 * sx, 0.5 * sy), (0.5 * sx, 0.5 * sy), (1.5 * sx, 0.5 * sy)],
+        # 7 piles: center pile plus six piles on a regular hexagonal ring.
+        7: [(0.0, -sy), (-rt3 * sx / 2.0, -0.5 * sy), (rt3 * sx / 2.0, -0.5 * sy),
+            (0.0, 0.0), (-rt3 * sx / 2.0, 0.5 * sy), (rt3 * sx / 2.0, 0.5 * sy), (0.0, sy)],
+        # 8 piles: compact staggered 3-2-3 layout from the reference sketch.
+        8: [(-rt2 * sx, -sy / rt2), (0.0, -sy / rt2), (rt2 * sx, -sy / rt2),
+            (-sx / rt2, 0.0), (sx / rt2, 0.0),
+            (-rt2 * sx, sy / rt2), (0.0, sy / rt2), (rt2 * sx, sy / rt2)],
         9: [(-sx, -sy), (0.0, -sy), (sx, -sy), (-sx, 0.0), (0.0, 0.0), (sx, 0.0), (-sx, sy), (0.0, sy), (sx, sy)],
-        10: [(-2 * sx, -0.5 * sy), (-sx, -0.5 * sy), (0.0, -0.5 * sy), (sx, -0.5 * sy), (2 * sx, -0.5 * sy),
-             (-2 * sx, 0.5 * sy), (-sx, 0.5 * sy), (0.0, 0.5 * sy), (sx, 0.5 * sy), (2 * sx, 0.5 * sy)],
-        11: [(-2 * sx, -sy), (-sx, -sy), (0.0, -sy), (sx, -sy), (2 * sx, -sy),
+        # 10 and 11 piles: staggered triangular-grid layouts with total row
+        # spacing of 3*sqrt(3)D between exterior rows.
+        10: [(-sx, -rt3 * sy / 2.0), (0.0, -rt3 * sy / 2.0), (sx, -rt3 * sy / 2.0),
              (-1.5 * sx, 0.0), (-0.5 * sx, 0.0), (0.5 * sx, 0.0), (1.5 * sx, 0.0),
-             (-0.5 * sx, sy), (0.5 * sx, sy)],
+             (-sx, rt3 * sy / 2.0), (0.0, rt3 * sy / 2.0), (sx, rt3 * sy / 2.0)],
+        11: [(-1.5 * sx, -rt3 * sy / 2.0), (-0.5 * sx, -rt3 * sy / 2.0), (0.5 * sx, -rt3 * sy / 2.0), (1.5 * sx, -rt3 * sy / 2.0),
+             (-sx, 0.0), (0.0, 0.0), (sx, 0.0),
+             (-1.5 * sx, rt3 * sy / 2.0), (-0.5 * sx, rt3 * sy / 2.0), (0.5 * sx, rt3 * sy / 2.0), (1.5 * sx, rt3 * sy / 2.0)],
         12: [(-1.5 * sx, -sy), (-0.5 * sx, -sy), (0.5 * sx, -sy), (1.5 * sx, -sy),
              (-1.5 * sx, 0.0), (-0.5 * sx, 0.0), (0.5 * sx, 0.0), (1.5 * sx, 0.0),
              (-1.5 * sx, sy), (-0.5 * sx, sy), (0.5 * sx, sy), (1.5 * sx, sy)],
@@ -1992,16 +2013,18 @@ def load_input_ui() -> LoadCase:
 
 def pile_layout_ui(geom: Geometry) -> List[PilePoint]:
     st.subheader("Pile Layout")
-    st.caption("Use the generated template or edit coordinates directly. The app recenters the pile group at its centroid.")
+    st.caption("Generated coordinates follow the reference pile arrangement sketches. You can still edit coordinates directly; the app recenters the pile group at its centroid.")
 
     regenerate = st.button("Regenerate layout from template", use_container_width=False)
 
     key = "pile_layout_df"
     apply_saved_pile_layout_if_needed(geom.pile_diameter_mm)
     expected_n = int(geom.n_piles)
-    if regenerate or key not in st.session_state or len(st.session_state[key]) != expected_n:
+    template_changed = st.session_state.get("pile_layout_template_version") != PILE_LAYOUT_TEMPLATE_VERSION
+    if regenerate or template_changed or key not in st.session_state or len(st.session_state[key]) != expected_n:
         piles = make_piles(expected_n, geom.spacing_x_mm, geom.spacing_y_mm, geom.pile_diameter_mm)
         st.session_state[key] = piles_to_dataframe(piles)
+        st.session_state["pile_layout_template_version"] = PILE_LAYOUT_TEMPLATE_VERSION
 
     editable = st.data_editor(
         st.session_state[key],
