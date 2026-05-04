@@ -34,7 +34,7 @@ from __future__ import annotations
 import io
 import math
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
@@ -95,13 +95,46 @@ DEFAULT_STRENGTH_COMBOS = {
 ACI_REFERENCES = {
     "general": "ACI CODE-318-25 should be used directly for final design and detailing.",
     "flexure": "ACI-style strength design: phi Mn >= Mu. Rectangular section, singly-reinforced simplification.",
-    "one_way_shear": "ACI-style concrete shear expression for nonprestressed members; verify exact ACI 318-25 modifiers.",
-    "two_way_shear": "ACI-style two-way shear/punching check around loaded area; verify beta, alpha_s and edge/corner cases.",
-    "development": "ACI-style tension development estimate; engineer must verify all modifiers and confinement.",
+    "one_way_shear": "ACI-style concrete shear expression including rho_w and lambda_s size effect; verify exact ACI 318-25 modifiers.",
+    "two_way_shear": "ACI-style two-way shear/punching check using the least of beta, alpha_s, and upper-limit equations.",
+    "development": "ACI-style tension development estimate including cb/Ktr confinement term; engineer must verify Chapter 25 modifiers.",
     "stm": "MacGregor-style practical load-path/strut-and-tie advisory for deep pile caps; not a substitute for full STM.",
 }
 
 PILE_LAYOUT_TEMPLATE_VERSION = "reference-arrangements-2026-05"
+
+GROUP_DEFAULT_COLUMNS = {
+    "Group Name": "Foundation 1",
+    "Joint IDs": "",
+    "No. Piles": 4,
+    "Thickness (mm)": 1200.0,
+    "Pile Dia (mm)": 600.0,
+    "Spacing X (mm)": 1800.0,
+    "Spacing Y (mm)": 1800.0,
+    "Edge (mm)": 600.0,
+    "Pile Comp Cap (kN)": 1800.0,
+    "Pile Tension Cap (kN)": 400.0,
+}
+
+MANUAL_SERVICE_LOAD_DEFAULTS = {
+    "D Ps (kN)": 3000.0,
+    "D Msx (kN-m)": 0.0,
+    "D Msy (kN-m)": 0.0,
+    "L Ps (kN)": 2000.0,
+    "L Msx (kN-m)": 0.0,
+    "L Msy (kN-m)": 0.0,
+    "D Factor": 1.2,
+    "L Factor": 1.6,
+}
+
+MANUAL_SERVICE_LOAD_ALIASES = {
+    "D Ps (kN)": ["D Pu (kN)", "Pu (kN)"],
+    "D Msx (kN-m)": ["D Mux (kN-m)", "Mux (kN-m)"],
+    "D Msy (kN-m)": ["D Muy (kN-m)", "Muy (kN-m)"],
+    "L Ps (kN)": ["L Pu (kN)"],
+    "L Msx (kN-m)": ["L Mux (kN-m)"],
+    "L Msy (kN-m)": ["L Muy (kN-m)"],
+}
 
 
 # =============================================================================
@@ -211,6 +244,7 @@ class Geometry:
     spacing_x_mm: float = 1800.0
     spacing_y_mm: float = 1800.0
     use_pedestal_for_shear: bool = True
+    column_location: str = "Interior"
 
 @dataclass
 class Reinforcement:
@@ -304,6 +338,8 @@ def status_badge(status: str) -> str:
         return "⚠️ NEAR"
     if s == "FAIL":
         return "❌ FAIL"
+    if s == "STM":
+        return "STM REVIEW"
     return s
 
 
@@ -475,8 +511,6 @@ def distribute_vertical_load_to_piles(
     Pu_kN: float,
     Mux_kNm: float,
     Muy_kNm: float,
-    include_self_weight_kN: float = 0.0,
-    sign_convention: str = "Compression positive",
 ) -> List[PilePoint]:
     """
     Elastic rigid pile-cap distribution.
@@ -489,12 +523,12 @@ def distribute_vertical_load_to_piles(
         - Mx is moment about X axis causing gradient along y.
         - My is moment about Y axis causing gradient along x.
         - Positive R means compression on pile.
-        - Sign convention can be changed by applying load signs in input.
+        - Apply the desired sign convention before calling this function.
     """
     if not piles:
         return []
     n = len(piles)
-    P_total = Pu_kN + include_self_weight_kN
+    P_total = Pu_kN
     xs_m = np.array([mm_to_m(p.x_mm) for p in piles], dtype=float)
     ys_m = np.array([mm_to_m(p.y_mm) for p in piles], dtype=float)
     sum_x2 = float(np.sum(xs_m**2))
@@ -523,6 +557,7 @@ def pile_group_result_table(piles: List[PilePoint], geom: Geometry) -> pd.DataFr
         rows.append(
             {
                 "Pile": p.label,
+                "No. Piles": geom.n_piles,
                 "x (mm)": p.x_mm,
                 "y (mm)": p.y_mm,
                 "R, compression + (kN)": p.reaction_kN,
@@ -578,8 +613,30 @@ def make_saved_state_xlsx(state: DesignState, results: Dict[str, Any], include_s
                 {"Item": "Pu total", "Value": results["Pu_total_kN"], "Unit": "kN"},
                 {"Item": "X bars required As", "Value": results["flex_x"]["As_req_mm2"], "Unit": "mm2"},
                 {"Item": "Y bars required As", "Value": results["flex_y"]["As_req_mm2"], "Unit": "mm2"},
+                {"Item": "Top X bars required As", "Value": results["top_flex_x"]["As_req_mm2"], "Unit": "mm2"},
+                {"Item": "Top Y bars required As", "Value": results["top_flex_y"]["As_req_mm2"], "Unit": "mm2"},
             ]
         ).to_excel(writer, sheet_name="summary", index=False)
+        if "sap2000_import_df" in st.session_state and isinstance(st.session_state["sap2000_import_df"], pd.DataFrame):
+            st.session_state["sap2000_import_df"].to_excel(writer, sheet_name="sap2000_import", index=False)
+        groups_source = st.session_state.get("active_groups_df")
+        if not isinstance(groups_source, pd.DataFrame) or groups_source.empty:
+            groups_source = st.session_state.get("sap_groups_df")
+        if not isinstance(groups_source, pd.DataFrame) or groups_source.empty:
+            groups_source = st.session_state.get("manual_foundations_df")
+        if isinstance(groups_source, pd.DataFrame) and not groups_source.empty:
+            groups_df = groups_source
+            groups_df.to_excel(writer, sheet_name="groups", index=False)
+            group_rows = []
+            if "Group Name" in groups_df.columns and "Joint IDs" in groups_df.columns:
+                for _, row in groups_df.iterrows():
+                    for joint in parse_joint_list(row.get("Joint IDs", "")):
+                        group_rows.append({"Group Name": row.get("Group Name", ""), "Joint": joint})
+            pd.DataFrame(group_rows).to_excel(writer, sheet_name="group_joints", index=False)
+        batch = st.session_state.get("batch_design")
+        if isinstance(batch, dict):
+            batch.get("summary", pd.DataFrame()).to_excel(writer, sheet_name="design_results_summary", index=False)
+            batch.get("pile_envelopes", pd.DataFrame()).to_excel(writer, sheet_name="pile_reaction_envelopes", index=False)
     return buf.getvalue()
 
 
@@ -595,7 +652,16 @@ def read_saved_state_xlsx(uploaded_file) -> Optional[Dict[str, Any]]:
             "reinforcement": dataframe_to_key_values(sheets.get("reinforcement", pd.DataFrame())),
             "loadcase": dataframe_to_key_values(sheets.get("loadcase", pd.DataFrame())),
             "piles": sheets.get("piles", pd.DataFrame()),
+            "sap2000_import": sheets.get("sap2000_import", pd.DataFrame()),
+            "groups": sheets.get("groups", pd.DataFrame()),
+            "group_joints": sheets.get("group_joints", pd.DataFrame()),
+            "design_results_summary": sheets.get("design_results_summary", pd.DataFrame()),
+            "pile_reaction_envelopes": sheets.get("pile_reaction_envelopes", pd.DataFrame()),
         }
+        if not payload["sap2000_import"].empty:
+            st.session_state["sap2000_import_df"] = payload["sap2000_import"]
+        if not payload["groups"].empty:
+            st.session_state["sap_groups_df"] = payload["groups"]
         if payload["geometry"] or payload["material"] or not payload["piles"].empty:
             return payload
         st.warning("Saved state workbook is missing expected sheets.")
@@ -655,7 +721,8 @@ def apply_saved_pile_layout_if_needed(default_dia: float) -> None:
 def beta1_aci(fc_MPa: float) -> float:
     """
     ACI-style beta1 expression in MPa.
-    0.85 for fc' <= 28 MPa, decreasing 0.05 per 7 MPa to minimum 0.65.
+    SI approximation of the ACI beta1 table: 28 MPa is approximately 4000 psi;
+    beta1 decreases 0.05 for each additional 7 MPa to a minimum of 0.65.
     Verify against the governing code edition.
     """
     if fc_MPa <= 28.0:
@@ -673,6 +740,9 @@ def flexural_As_required(
 ) -> Dict[str, float]:
     """
     Required tensile steel area for singly reinforced rectangular section.
+    Minimum steel uses the common ACI beam expression as a preliminary design
+    floor; verify footing/deep-beam minimum reinforcement provisions for final
+    pile-cap classification.
 
     Solves:
         phi * As * fy * (d - a/2) >= Mu
@@ -752,15 +822,39 @@ def one_way_shear_capacity(
     fc_MPa: float,
     lambda_c: float,
     phi: float = 0.75,
-    vc_factor: float = 0.17,
+    rho_w: float = 0.0025,
+    Nu_kN: float = 0.0,
+    Ag_mm2: Optional[float] = None,
 ) -> Dict[str, float]:
     """
-    ACI-style one-way concrete shear:
-        Vc = vc_factor * lambda * sqrt(fc') * b * d
-    Units N -> kN.
+    ACI-style one-way concrete shear for members without shear reinforcement:
+        Vc = [0.66 * lambda_s * lambda * rho_w^(1/3) * sqrt(fc') + Nu/(6Ag)] * b * d
+
+    A conservative cap is also applied to the concrete stress term:
+        vc <= 0.42 * lambda * sqrt(fc')
+
+    SI units: fc in MPa, b and d in mm. The lambda_s expression uses d in mm.
     """
-    Vc_N = vc_factor * lambda_c * math.sqrt(fc_MPa) * b_mm * d_mm
-    return {"Vc_kN": kN_from_N(Vc_N), "phiVc_kN": kN_from_N(phi * Vc_N)}
+    lambda_s = min(1.0, math.sqrt(2.0 / (1.0 + 0.004 * max(d_mm, 0.0))))
+    rho_use = min(max(rho_w, 0.0001), 0.08)
+    axial_stress = 0.0
+    if Ag_mm2 and Ag_mm2 > 0:
+        axial_stress = kN_to_N(Nu_kN) / (6.0 * Ag_mm2)
+        axial_stress = min(axial_stress, 0.05 * fc_MPa)
+    vc_refined = 0.66 * lambda_s * lambda_c * (rho_use ** (1.0 / 3.0)) * math.sqrt(fc_MPa) + axial_stress
+    vc_limit = 0.42 * lambda_c * math.sqrt(fc_MPa)
+    vc_use = min(vc_refined, vc_limit)
+    Vc_N = vc_use * b_mm * d_mm
+    return {
+        "Vc_kN": kN_from_N(Vc_N),
+        "phiVc_kN": kN_from_N(phi * Vc_N),
+        "lambda_s": lambda_s,
+        "rho_w": rho_use,
+        "vc_MPa": vc_use,
+        "vc_refined_MPa": vc_refined,
+        "vc_limit_MPa": vc_limit,
+        "Nu_over_6Ag_MPa": axial_stress,
+    }
 
 
 def two_way_shear_capacity(
@@ -769,16 +863,44 @@ def two_way_shear_capacity(
     fc_MPa: float,
     lambda_c: float,
     phi: float = 0.75,
-    vc_factor: float = 0.33,
+    loaded_bx_mm: float = 1.0,
+    loaded_by_mm: float = 1.0,
+    column_location: str = "Interior",
 ) -> Dict[str, float]:
     """
-    Simplified interior punching shear:
-        Vc = vc_factor * lambda * sqrt(fc') * bo * d
+    ACI-style two-way punching shear without shear reinforcement:
+        vc is the least of:
+        a) 0.33 * lambda_s * lambda * sqrt(fc')
+        b) (0.17 + 0.33 / beta) * lambda_s * lambda * sqrt(fc')
+        c) (0.17 + 0.083 * alpha_s * d / bo) * lambda_s * lambda * sqrt(fc')
 
-    For edge/corner columns or high unbalanced moment, engineer must modify.
+    SI units: fc in MPa, bo and d in mm. The lambda_s expression uses d in mm.
     """
-    Vc_N = vc_factor * lambda_c * math.sqrt(fc_MPa) * bo_mm * d_mm
-    return {"Vc_kN": kN_from_N(Vc_N), "phiVc_kN": kN_from_N(phi * Vc_N)}
+    lambda_s = min(1.0, math.sqrt(2.0 / (1.0 + 0.004 * max(d_mm, 0.0))))
+    loaded_short = max(min(loaded_bx_mm, loaded_by_mm), 1e-9)
+    beta = max(max(loaded_bx_mm, loaded_by_mm) / loaded_short, 1.0)
+    loc = str(column_location or "Interior").strip().lower()
+    alpha_s = 40.0 if loc.startswith("interior") else 30.0 if loc.startswith("edge") else 20.0
+    root_fc = math.sqrt(fc_MPa)
+    vc_a = 0.33 * lambda_s * lambda_c * root_fc
+    vc_b = (0.17 + 0.33 / beta) * lambda_s * lambda_c * root_fc
+    vc_c = (0.17 + 0.083 * alpha_s * d_mm / max(bo_mm, 1e-9)) * lambda_s * lambda_c * root_fc
+    options = {"upper_limit": vc_a, "beta_limit": vc_b, "alpha_s_limit": vc_c}
+    governing = min(options, key=options.get)
+    vc_use = options[governing]
+    Vc_N = vc_use * bo_mm * d_mm
+    return {
+        "Vc_kN": kN_from_N(Vc_N),
+        "phiVc_kN": kN_from_N(phi * Vc_N),
+        "lambda_s": lambda_s,
+        "beta": beta,
+        "alpha_s": alpha_s,
+        "vc_MPa": vc_use,
+        "vc_upper_limit_MPa": vc_a,
+        "vc_beta_limit_MPa": vc_b,
+        "vc_alpha_s_limit_MPa": vc_c,
+        "governing_equation": governing,
+    }
 
 
 def concrete_bearing_capacity(
@@ -800,18 +922,31 @@ def development_length_tension_estimate(
     psi_t: float = 1.0,
     psi_e: float = 1.0,
     psi_s: float = 1.0,
-    confinement_factor: float = 1.0,
+    clear_cover_mm: Optional[float] = None,
+    clear_spacing_mm: Optional[float] = None,
+    Ktr_mm: float = 0.0,
     min_ld_mm: float = 300.0,
-) -> float:
+) -> Dict[str, float]:
     """
-    Editable ACI-style development length estimate.
+    Editable ACI-style development length estimate using a cb/Ktr confinement term.
 
-    This is intentionally transparent and conservative for app-level preliminary design.
-    Final design must check the exact ACI 318-25 development provisions and all modifiers.
+    This remains a design aid: exact Chapter 25 modifiers, excess reinforcement,
+    epoxy/coating, casting position, hooks, headed bars, and transverse steel
+    detailing must be verified for final design.
     """
-    confinement_factor = min(max(confinement_factor, 1.0), 2.5)
-    ld = (fy_MPa * psi_t * psi_e * psi_s / (1.1 * lambda_c * math.sqrt(fc_MPa))) * db_mm / confinement_factor
-    return max(min_ld_mm, ld)
+    cover_cb = clear_cover_mm + 0.5 * db_mm if clear_cover_mm is not None else db_mm
+    spacing_cb = 0.5 * clear_spacing_mm if clear_spacing_mm is not None else db_mm
+    cb = max(min(cover_cb, spacing_cb), 0.5 * db_mm)
+    confinement_factor = min(max((cb + max(Ktr_mm, 0.0)) / max(db_mm, 1e-9), 1.5), 2.5)
+    ld_calc = (fy_MPa * psi_t * psi_e * psi_s / (1.1 * lambda_c * math.sqrt(fc_MPa))) * db_mm / confinement_factor
+    ld = max(min_ld_mm, ld_calc)
+    return {
+        "ld_mm": ld,
+        "ld_calc_mm": ld_calc,
+        "cb_mm": cb,
+        "Ktr_mm": max(Ktr_mm, 0.0),
+        "confinement_factor": confinement_factor,
+    }
 
 
 def spacing_for_As(
@@ -835,6 +970,18 @@ def spacing_for_As(
     return {"spacing_req_mm": s_req, "spacing_use_mm": s_use, "n_bars": n_bars, "As_prov_mm2": As_prov}
 
 
+def provided_spacing_As(bar: str, spacing_mm: float, strip_width_mm: float) -> Dict[str, float]:
+    spacing_use = max(safe_float(spacing_mm, 150.0), 1.0)
+    n_bars = int(math.floor(strip_width_mm / spacing_use)) + 1
+    As_prov = n_bars * bar_area(bar)
+    return {
+        "spacing_req_mm": spacing_use,
+        "spacing_use_mm": spacing_use,
+        "n_bars": n_bars,
+        "As_prov_mm2": As_prov,
+    }
+
+
 # =============================================================================
 # FOOTING / PILE CAP DESIGN ACTIONS
 # =============================================================================
@@ -849,6 +996,35 @@ def effective_depths(geom: Geometry, reinf: Reinforcement) -> Tuple[float, float
     d_x = geom.cap_thickness_mm - geom.bottom_cover_mm - db_x / 2.0
     d_y = geom.cap_thickness_mm - geom.bottom_cover_mm - db_x - db_y / 2.0
     return max(d_x, 1.0), max(d_y, 1.0)
+
+
+def top_effective_depths(geom: Geometry, reinf: Reinforcement) -> Tuple[float, float]:
+    """
+    Effective depths for top reinforcement checked with bottom face in compression.
+    Top X and Y layers use the same top bar size; Y is treated as the second layer.
+    """
+    db = bar_diameter(reinf.top_bar)
+    d_top_x = geom.cap_thickness_mm - geom.top_cover_mm - db / 2.0
+    d_top_y = geom.cap_thickness_mm - geom.top_cover_mm - db - db / 2.0
+    return max(d_top_x, 1.0), max(d_top_y, 1.0)
+
+
+def calculate_material_takeoff(state: DesignState, results: Dict[str, Any]) -> Dict[str, float]:
+    """Estimates concrete volume and main flexural rebar weight."""
+    vol_m3 = mm_to_m(state.cap_length_x_mm) * mm_to_m(state.cap_width_y_mm) * mm_to_m(state.geometry.cap_thickness_mm)
+    density_kg_mm3 = 7.85e-6
+
+    weight_x_kg = results["spacing_x"]["As_prov_mm2"] * state.cap_length_x_mm * density_kg_mm3
+    weight_y_kg = results["spacing_y"]["As_prov_mm2"] * state.cap_width_y_mm * density_kg_mm3
+    weight_top_x_kg = results.get("top_spacing_x", {}).get("As_prov_mm2", 0.0) * state.cap_length_x_mm * density_kg_mm3
+    weight_top_y_kg = results.get("top_spacing_y", {}).get("As_prov_mm2", 0.0) * state.cap_width_y_mm * density_kg_mm3
+    total_rebar_kg = weight_x_kg + weight_y_kg + weight_top_x_kg + weight_top_y_kg
+
+    return {
+        "concrete_vol_m3": vol_m3,
+        "main_rebar_kg": total_rebar_kg,
+        "rebar_ratio_kg_m3": total_rebar_kg / max(vol_m3, 1e-9)
+    }
 
 
 def self_weight_cap_kN(cap_x_mm: float, cap_y_mm: float, thickness_mm: float, gamma_kN_m3: float) -> float:
@@ -907,8 +1083,8 @@ def one_way_shear_demands(
     """
     One-way shear at d from face of loaded area in both directions.
 
-    Vx section: vertical shear for strip spanning in X direction, section at x face + d_y.
-    Vy section: vertical shear for strip spanning in Y direction, section at y face + d_x.
+    Section normal to Y for X bars uses y-face + d_x.
+    Section normal to X for Y bars uses x-face + d_y.
 
     We return maximum of two sides.
     """
@@ -918,10 +1094,18 @@ def one_way_shear_demands(
     x_sec = loaded_bx / 2.0 + d_y_mm
     y_sec = loaded_by / 2.0 + d_x_mm
 
-    V_right = sum(max(p.reaction_kN, 0.0) for p in piles if p.x_mm > x_sec)
-    V_left = sum(max(p.reaction_kN, 0.0) for p in piles if p.x_mm < -x_sec)
-    V_top = sum(max(p.reaction_kN, 0.0) for p in piles if p.y_mm > y_sec)
-    V_bottom = sum(max(p.reaction_kN, 0.0) for p in piles if p.y_mm < -y_sec)
+    def one_way_contribution(coord: float, section: float, dia: float, positive_side: bool) -> float:
+        distance = coord - section if positive_side else -coord - section
+        if distance >= dia / 2.0:
+            return 1.0
+        if distance <= -dia / 2.0:
+            return 0.0
+        return 0.5
+
+    V_right = sum(max(p.reaction_kN, 0.0) * one_way_contribution(p.x_mm, x_sec, p.diameter_mm, True) for p in piles)
+    V_left = sum(max(p.reaction_kN, 0.0) * one_way_contribution(p.x_mm, x_sec, p.diameter_mm, False) for p in piles)
+    V_top = sum(max(p.reaction_kN, 0.0) * one_way_contribution(p.y_mm, y_sec, p.diameter_mm, True) for p in piles)
+    V_bottom = sum(max(p.reaction_kN, 0.0) * one_way_contribution(p.y_mm, y_sec, p.diameter_mm, False) for p in piles)
 
     return {
         "V_right_kN": V_right,
@@ -943,7 +1127,8 @@ def punching_shear_demand(
     Simplified punching shear around loaded area at d/2.
 
     In pile caps, pile reactions inside the critical perimeter reduce punching demand.
-    This uses a rectangular perimeter around the column/pedestal.
+    Pile reactions near the critical section are linearly proportioned across a
+    band equal to one pile radius on each side of the critical section.
     """
     loaded_bx = geom.pedestal_bx_mm if geom.use_pedestal_for_shear else geom.column_bx_mm
     loaded_by = geom.pedestal_by_mm if geom.use_pedestal_for_shear else geom.column_by_mm
@@ -951,20 +1136,38 @@ def punching_shear_demand(
     x_lim = loaded_bx / 2.0 + d_avg_mm / 2.0
     y_lim = loaded_by / 2.0 + d_avg_mm / 2.0
 
-    inside = []
-    outside = []
+    def signed_distance_to_rectangle(x_mm: float, y_mm: float) -> float:
+        dx_out = max(abs(x_mm) - x_lim, 0.0)
+        dy_out = max(abs(y_mm) - y_lim, 0.0)
+        if dx_out > 0.0 or dy_out > 0.0:
+            return math.hypot(dx_out, dy_out)
+        return -min(x_lim - abs(x_mm), y_lim - abs(y_mm))
+
+    reduction_rows = []
     for p in piles:
-        if abs(p.x_mm) <= x_lim and abs(p.y_mm) <= y_lim:
-            inside.append(p)
+        radius = max(p.diameter_mm / 2.0, 1e-9)
+        signed_dist = signed_distance_to_rectangle(p.x_mm, p.y_mm)
+        if signed_dist <= -radius:
+            factor = 1.0
+        elif signed_dist >= radius:
+            factor = 0.0
         else:
-            outside.append(p)
+            factor = (radius - signed_dist) / (2.0 * radius)
+        reaction = max(p.reaction_kN, 0.0)
+        reduction_rows.append(
+            {
+                "pile": p.label,
+                "factor": factor,
+                "reaction_kN": reaction,
+                "reduction_kN": factor * reaction,
+                "distance_to_perimeter_mm": signed_dist,
+            }
+        )
 
-    R_inside = sum(max(p.reaction_kN, 0.0) for p in inside)
-    R_outside = sum(max(p.reaction_kN, 0.0) for p in outside)
+    R_inside = sum(row["reduction_kN"] for row in reduction_rows)
+    R_outside = sum(row["reaction_kN"] - row["reduction_kN"] for row in reduction_rows)
 
-    Vu_by_column_minus_inside = max(Pu_total_kN - R_inside, 0.0)
-    Vu_by_outside = R_outside
-    Vu = min(max(Vu_by_column_minus_inside, Vu_by_outside), max(Pu_total_kN, R_outside))
+    Vu = max(Pu_total_kN - R_inside, 0.0)
 
     bo = 2.0 * (loaded_bx + d_avg_mm + loaded_by + d_avg_mm)
 
@@ -975,7 +1178,8 @@ def punching_shear_demand(
         "bo_mm": bo,
         "x_crit_half_mm": x_lim,
         "y_crit_half_mm": y_lim,
-        "piles_inside": ", ".join([p.label for p in inside]) if inside else "-",
+        "piles_inside": ", ".join([row["pile"] for row in reduction_rows if row["factor"] >= 0.999]) or "-",
+        "pile_reduction_factors": ", ".join([f"{row['pile']}={row['factor']:.2f}" for row in reduction_rows]),
     }
 
 
@@ -990,29 +1194,26 @@ def stm_advisory(
 
     The load path is idealized from loaded area centroid to each pile head.
     For each pile:
-        a = horizontal distance from column/pedestal face to pile center, not less than small number.
+        a = horizontal distance from column/pedestal centroid to pile center, not less than small number.
         theta = atan(d / a)
         T_est = R * cot(theta), an indicative tie force along bottom reinforcement direction.
 
     The vector is split into x/y components based on pile plan location.
     """
-    loaded_bx = geom.pedestal_bx_mm if geom.use_pedestal_for_shear else geom.column_bx_mm
-    loaded_by = geom.pedestal_by_mm if geom.use_pedestal_for_shear else geom.column_by_mm
-
     rows = []
     for p in piles:
-        dx_out = max(abs(p.x_mm) - loaded_bx / 2.0, 0.0)
-        dy_out = max(abs(p.y_mm) - loaded_by / 2.0, 0.0)
-        a = math.sqrt(dx_out**2 + dy_out**2)
+        dx = p.x_mm
+        dy = p.y_mm
+        a = math.sqrt(dx**2 + dy**2)
         if a < 1.0:
-            a = max(0.5 * max(loaded_bx, loaded_by), 1.0)
+            a = 1.0
         theta_rad = math.atan2(d_avg_mm, a)
         theta_deg = math.degrees(theta_rad)
         cot_theta = 1.0 / max(math.tan(theta_rad), 1e-9)
         R = max(p.reaction_kN, 0.0)
         T = R * cot_theta
-        ux = dx_out / max(a, 1e-9)
-        uy = dy_out / max(a, 1e-9)
+        ux = abs(dx) / max(a, 1e-9)
+        uy = abs(dy) / max(a, 1e-9)
         Tx = T * ux
         Ty = T * uy
 
@@ -1051,6 +1252,7 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
     cap_x = state.cap_length_x_mm
     cap_y = state.cap_width_y_mm
     d_x, d_y = effective_depths(geom, reinf)
+    d_top_x, d_top_y = top_effective_depths(geom, reinf)
     d_avg = 0.5 * (d_x + d_y)
 
     Pu_total = state.loadcase.Pu_kN + (state.self_weight_kN if use_self_weight else 0.0)
@@ -1060,69 +1262,139 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
     punch_demand = punching_shear_demand(state.piles, geom, d_avg, Pu_total)
 
     # Flexure:
-    # X bars resist cantilever action along y; section width is cap_x.
-    # Y bars resist cantilever action along x; section width is cap_y.
+    # X bars use the cap width perpendicular to the X-bar span; Y bars use the
+    # cap width perpendicular to the Y-bar span.
     flex_x = flexural_As_required(
-        moment_demands["M_for_X_bars_kNm"], cap_x, d_x, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure
+        moment_demands["M_for_X_bars_kNm"], cap_y, d_x, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure
     )
     flex_y = flexural_As_required(
-        moment_demands["M_for_Y_bars_kNm"], cap_y, d_y, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure
+        moment_demands["M_for_Y_bars_kNm"], cap_x, d_y, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure
     )
 
-    sp_x = spacing_for_As(
-        flex_x["As_req_mm2"],
-        reinf.main_bar_x,
-        cap_y,
-        reinf.preferred_spacing_step_mm,
-        s_min_mm=75.0,
-        s_max_mm=min(300.0, 3.0 * geom.cap_thickness_mm),
+    top_flex_x = flexural_As_required(
+        moment_demands["M_for_X_bars_kNm"], cap_y, d_top_x, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure
     )
-    sp_y = spacing_for_As(
-        flex_y["As_req_mm2"],
-        reinf.main_bar_y,
-        cap_x,
-        reinf.preferred_spacing_step_mm,
-        s_min_mm=75.0,
-        s_max_mm=min(300.0, 3.0 * geom.cap_thickness_mm),
+    top_flex_y = flexural_As_required(
+        moment_demands["M_for_Y_bars_kNm"], cap_x, d_top_y, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure
     )
 
-    cap_xbars = flexural_capacity(sp_x["As_prov_mm2"], cap_x, d_x, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure)
-    cap_ybars = flexural_capacity(sp_y["As_prov_mm2"], cap_y, d_y, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure)
+    sp_x = provided_spacing_As(reinf.main_bar_x, reinf.spacing_x_mm, cap_y)
+    sp_y = provided_spacing_As(reinf.main_bar_y, reinf.spacing_y_mm, cap_x)
+    top_sp_x = provided_spacing_As(reinf.top_bar, reinf.top_spacing_mm, cap_y)
+    top_sp_y = provided_spacing_As(reinf.top_bar, reinf.top_spacing_mm, cap_x)
 
-    # One-way shear capacities:
-    # For shear in x direction, critical section length across full y dimension.
-    ow_ybars = one_way_shear_capacity(cap_y, d_y, mat.fc_MPa, mat.lambda_c, mat.phi_shear)
-    ow_xbars = one_way_shear_capacity(cap_x, d_x, mat.fc_MPa, mat.lambda_c, mat.phi_shear)
+    cap_xbars = flexural_capacity(sp_x["As_prov_mm2"], cap_y, d_x, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure)
+    cap_ybars = flexural_capacity(sp_y["As_prov_mm2"], cap_x, d_y, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure)
+    top_cap_xbars = flexural_capacity(top_sp_x["As_prov_mm2"], cap_y, d_top_x, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure)
+    top_cap_ybars = flexural_capacity(top_sp_y["As_prov_mm2"], cap_x, d_top_y, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure)
+    rho_x_provided = sp_x["As_prov_mm2"] / max(cap_y * d_x, 1e-9)
+    rho_y_provided = sp_y["As_prov_mm2"] / max(cap_x * d_y, 1e-9)
+
+    # One-way shear capacities by section orientation.
+    ow_sec_normal_to_x = one_way_shear_capacity(
+        cap_y, d_y, mat.fc_MPa, mat.lambda_c, mat.phi_shear, rho_w=rho_y_provided
+    )
+    ow_sec_normal_to_y = one_way_shear_capacity(
+        cap_x, d_x, mat.fc_MPa, mat.lambda_c, mat.phi_shear, rho_w=rho_x_provided
+    )
 
     # Punching capacity:
+    loaded_bx = geom.pedestal_bx_mm if geom.use_pedestal_for_shear else geom.column_bx_mm
+    loaded_by = geom.pedestal_by_mm if geom.use_pedestal_for_shear else geom.column_by_mm
     punch_cap = two_way_shear_capacity(
-        punch_demand["bo_mm"], d_avg, mat.fc_MPa, mat.lambda_c, mat.phi_shear
+        punch_demand["bo_mm"],
+        d_avg,
+        mat.fc_MPa,
+        mat.lambda_c,
+        mat.phi_shear,
+        loaded_bx_mm=loaded_bx,
+        loaded_by_mm=loaded_by,
+        column_location=geom.column_location,
     )
 
     # Bearing at column/pedestal:
-    loaded_area = (
-        (geom.pedestal_bx_mm if geom.use_pedestal_for_shear else geom.column_bx_mm)
-        * (geom.pedestal_by_mm if geom.use_pedestal_for_shear else geom.column_by_mm)
-    )
+    loaded_area = loaded_bx * loaded_by
     bearing = concrete_bearing_capacity(loaded_area, mat.fc_MPa, mat.phi_bearing)
 
     # Development lengths:
+    db_x = bar_diameter(reinf.main_bar_x)
+    db_y = bar_diameter(reinf.main_bar_y)
     ld_x = development_length_tension_estimate(
-        bar_diameter(reinf.main_bar_x), mat.fc_MPa, mat.fy_MPa, mat.lambda_c, psi_t=1.0, psi_e=1.0, psi_s=1.0
+        db_x,
+        mat.fc_MPa,
+        mat.fy_MPa,
+        mat.lambda_c,
+        psi_t=1.0,
+        psi_e=1.0,
+        psi_s=0.8 if db_x <= 16.0 else 1.0,
+        clear_cover_mm=min(geom.bottom_cover_mm, geom.side_cover_mm),
+        clear_spacing_mm=max(sp_x["spacing_use_mm"] - db_x, 0.0),
     )
     ld_y = development_length_tension_estimate(
-        bar_diameter(reinf.main_bar_y), mat.fc_MPa, mat.fy_MPa, mat.lambda_c, psi_t=1.0, psi_e=1.0, psi_s=1.0
+        db_y,
+        mat.fc_MPa,
+        mat.fy_MPa,
+        mat.lambda_c,
+        psi_t=1.0,
+        psi_e=1.0,
+        psi_s=0.8 if db_y <= 16.0 else 1.0,
+        clear_cover_mm=min(geom.bottom_cover_mm, geom.side_cover_mm),
+        clear_spacing_mm=max(sp_y["spacing_use_mm"] - db_y, 0.0),
+    )
+    db_top = bar_diameter(reinf.top_bar)
+    ld_top = development_length_tension_estimate(
+        db_top,
+        mat.fc_MPa,
+        mat.fy_MPa,
+        mat.lambda_c,
+        psi_t=1.0,
+        psi_e=1.0,
+        psi_s=0.8 if db_top <= 16.0 else 1.0,
+        clear_cover_mm=min(geom.top_cover_mm, geom.side_cover_mm),
+        clear_spacing_mm=max(reinf.top_spacing_mm - db_top, 0.0),
     )
 
     # STM advisory:
     stm = stm_advisory(state.piles, geom, mat, d_avg)
     T_x_total = stm["Tx component (kN)"].sum() if not stm.empty else 0.0
     T_y_total = stm["Ty component (kN)"].sum() if not stm.empty else 0.0
-    As_stm_x = T_y_total * 1000.0 / max(mat.phi_stm_tie * mat.fy_MPa, 1e-9)  # X bars cross y action
-    As_stm_y = T_x_total * 1000.0 / max(mat.phi_stm_tie * mat.fy_MPa, 1e-9)  # Y bars cross x action
+    # Advisory tie area uses one side of the additive component total to avoid
+    # double-counting balanced left/right or top/bottom axial-load components.
+    As_stm_for_x_bars = 0.5 * T_y_total * 1000.0 / max(mat.phi_stm_tie * mat.fy_MPa, 1e-9)
+    As_stm_for_y_bars = 0.5 * T_x_total * 1000.0 / max(mat.phi_stm_tie * mat.fy_MPa, 1e-9)
 
     # Check results:
     checks = []
+    compression_sum = sum(max(p.reaction_kN, 0.0) for p in state.piles)
+
+    def sectional_shear_check(name: str, demand: float, capacity: float, note: str) -> CheckResult:
+        if demand <= 1e-9 and compression_sum > 1e-9:
+            return CheckResult(
+                name,
+                demand,
+                capacity,
+                np.nan,
+                "kN",
+                "STM",
+                note + " No pile reaction lies outside the d-from-face section; use STM/deep pile-cap load-path checks.",
+            )
+        ratio = demand / max(capacity, 1e-9)
+        return CheckResult(name, demand, capacity, ratio, "kN", status_from_ratio(ratio), note)
+
+    def punching_check(name: str, demand: float, capacity: float, note: str) -> CheckResult:
+        if demand <= 1e-9 and compression_sum > 1e-9 and punch_demand["R_inside_kN"] > 0.99 * compression_sum:
+            return CheckResult(
+                name,
+                demand,
+                capacity,
+                np.nan,
+                "kN",
+                "STM",
+                note + " Pile reactions are inside the punching perimeter; use STM/nodal-zone checks instead of treating this as a normal PASS.",
+            )
+        ratio = demand / max(capacity, 1e-9)
+        return CheckResult(name, demand, capacity, ratio, "kN", status_from_ratio(ratio), note)
+
     checks.append(
         CheckResult(
             "Pile compression",
@@ -1147,7 +1419,7 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
     )
     checks.append(
         CheckResult(
-            "Flexure - X bars",
+            "Flexure - bottom X bars",
             demand=moment_demands["M_for_X_bars_kNm"],
             capacity=cap_xbars["phiMn_kNm"],
             ratio=moment_demands["M_for_X_bars_kNm"] / max(cap_xbars["phiMn_kNm"], 1e-9),
@@ -1158,7 +1430,7 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
     )
     checks.append(
         CheckResult(
-            "Flexure - Y bars",
+            "Flexure - bottom Y bars",
             demand=moment_demands["M_for_Y_bars_kNm"],
             capacity=cap_ybars["phiMn_kNm"],
             ratio=moment_demands["M_for_Y_bars_kNm"] / max(cap_ybars["phiMn_kNm"], 1e-9),
@@ -1169,35 +1441,51 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
     )
     checks.append(
         CheckResult(
+            "Flexure - top X bars",
+            demand=moment_demands["M_for_X_bars_kNm"],
+            capacity=top_cap_xbars["phiMn_kNm"],
+            ratio=moment_demands["M_for_X_bars_kNm"] / max(top_cap_xbars["phiMn_kNm"], 1e-9),
+            unit="kN-m",
+            status=status_from_ratio(moment_demands["M_for_X_bars_kNm"] / max(top_cap_xbars["phiMn_kNm"], 1e-9)),
+            note="Top bars parallel to X checked against M1/M2 pile-cap bending demand; uplift and lateral effects neglected.",
+        )
+    )
+    checks.append(
+        CheckResult(
+            "Flexure - top Y bars",
+            demand=moment_demands["M_for_Y_bars_kNm"],
+            capacity=top_cap_ybars["phiMn_kNm"],
+            ratio=moment_demands["M_for_Y_bars_kNm"] / max(top_cap_ybars["phiMn_kNm"], 1e-9),
+            unit="kN-m",
+            status=status_from_ratio(moment_demands["M_for_Y_bars_kNm"] / max(top_cap_ybars["phiMn_kNm"], 1e-9)),
+            note="Top bars parallel to Y checked against M1/M2 pile-cap bending demand; uplift and lateral effects neglected.",
+        )
+    )
+    checks.append(
+        sectional_shear_check(
             "One-way shear - section normal to Y",
-            demand=shear_demands["V_for_X_bars_direction_kN"],
-            capacity=ow_xbars["phiVc_kN"],
-            ratio=shear_demands["V_for_X_bars_direction_kN"] / max(ow_xbars["phiVc_kN"], 1e-9),
-            unit="kN",
-            status=status_from_ratio(shear_demands["V_for_X_bars_direction_kN"] / max(ow_xbars["phiVc_kN"], 1e-9)),
-            note="Critical section at d from loaded area face; full cap width used.",
+            shear_demands["V_for_X_bars_direction_kN"],
+            ow_sec_normal_to_y["phiVc_kN"],
+            "Critical section at d from loaded area face; full cap width used.",
         )
     )
     checks.append(
-        CheckResult(
+        sectional_shear_check(
             "One-way shear - section normal to X",
-            demand=shear_demands["V_for_Y_bars_direction_kN"],
-            capacity=ow_ybars["phiVc_kN"],
-            ratio=shear_demands["V_for_Y_bars_direction_kN"] / max(ow_ybars["phiVc_kN"], 1e-9),
-            unit="kN",
-            status=status_from_ratio(shear_demands["V_for_Y_bars_direction_kN"] / max(ow_ybars["phiVc_kN"], 1e-9)),
-            note="Critical section at d from loaded area face; full cap width used.",
+            shear_demands["V_for_Y_bars_direction_kN"],
+            ow_sec_normal_to_x["phiVc_kN"],
+            "Critical section at d from loaded area face; full cap width used.",
         )
     )
     checks.append(
-        CheckResult(
+        punching_check(
             "Two-way punching shear",
-            demand=punch_demand["Vu_punch_kN"],
-            capacity=punch_cap["phiVc_kN"],
-            ratio=punch_demand["Vu_punch_kN"] / max(punch_cap["phiVc_kN"], 1e-9),
-            unit="kN",
-            status=status_from_ratio(punch_demand["Vu_punch_kN"] / max(punch_cap["phiVc_kN"], 1e-9)),
-            note=f"bo={punch_demand['bo_mm']:.0f} mm; piles inside perimeter: {punch_demand['piles_inside']}",
+            punch_demand["Vu_punch_kN"],
+            punch_cap["phiVc_kN"],
+            (
+                f"bo={punch_demand['bo_mm']:.0f} mm; vc governs by {punch_cap['governing_equation']}; "
+                f"pile reduction factors: {punch_demand['pile_reduction_factors']}"
+            ),
         )
     )
     checks.append(
@@ -1231,6 +1519,8 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
         "cap_y_mm": cap_y,
         "d_x_mm": d_x,
         "d_y_mm": d_y,
+        "d_top_x_mm": d_top_x,
+        "d_top_y_mm": d_top_y,
         "d_avg_mm": d_avg,
         "Pu_total_kN": Pu_total,
         "moment_demands": moment_demands,
@@ -1238,19 +1528,31 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
         "punch_demand": punch_demand,
         "flex_x": flex_x,
         "flex_y": flex_y,
+        "top_flex_x": top_flex_x,
+        "top_flex_y": top_flex_y,
         "spacing_x": sp_x,
         "spacing_y": sp_y,
+        "top_spacing_x": top_sp_x,
+        "top_spacing_y": top_sp_y,
         "cap_xbars": cap_xbars,
         "cap_ybars": cap_ybars,
-        "one_way_x": ow_xbars,
-        "one_way_y": ow_ybars,
+        "top_cap_xbars": top_cap_xbars,
+        "top_cap_ybars": top_cap_ybars,
+        "one_way_x": ow_sec_normal_to_y,
+        "one_way_y": ow_sec_normal_to_x,
         "punch_cap": punch_cap,
         "bearing": bearing,
-        "ld_x_mm": ld_x,
-        "ld_y_mm": ld_y,
+        "ld_x_mm": ld_x["ld_mm"],
+        "ld_y_mm": ld_y["ld_mm"],
+        "ld_top_mm": ld_top["ld_mm"],
+        "ld_x": ld_x,
+        "ld_y": ld_y,
+        "ld_top": ld_top,
         "stm": stm,
-        "As_stm_x_mm2": As_stm_x,
-        "As_stm_y_mm2": As_stm_y,
+        "As_stm_x_mm2": As_stm_for_x_bars,
+        "As_stm_y_mm2": As_stm_for_y_bars,
+        "As_stm_for_x_bars_mm2": As_stm_for_x_bars,
+        "As_stm_for_y_bars_mm2": As_stm_for_y_bars,
         "checks": checks,
     }
 
@@ -1265,14 +1567,80 @@ def read_uploaded_table(uploaded_file) -> Optional[pd.DataFrame]:
     name = uploaded_file.name.lower()
     try:
         if name.endswith(".csv"):
-            return pd.read_csv(uploaded_file)
+            raw = pd.read_csv(uploaded_file, header=None)
+            return normalize_sap2000_joint_reactions_table(raw)
         if name.endswith(".xlsx"):
-            return pd.read_excel(uploaded_file)
+            raw = pd.read_excel(uploaded_file, header=None)
+            return normalize_sap2000_joint_reactions_table(raw)
         st.warning("Unsupported file type. Please upload CSV or XLSX Excel.")
         return None
     except Exception as exc:
         st.error(f"Could not read file: {exc}")
         return None
+
+
+def normalize_sap2000_joint_reactions_table(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize SAP2000 exported TABLE: Joint Reactions sheets.
+
+    Expected export shape:
+        TABLE: Joint Reactions
+        Joint | OutputCase | CaseType | F1 | F2 | F3 | M1 | M2 | M3
+        Text  | Text       | Text     | KN | KN | KN | KN-m | KN-m | KN-m
+
+    Also accepts already-clean tables with these columns.
+    """
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    df = raw.copy()
+    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    if df.empty:
+        return pd.DataFrame()
+
+    expected = ["Joint", "OutputCase", "CaseType", "F1", "F2", "F3", "M1", "M2", "M3"]
+    existing_cols = [str(c).strip() for c in df.columns]
+    if all(col in existing_cols for col in ["Joint", "OutputCase", "F3"]):
+        out = df.copy()
+        out.columns = existing_cols
+    else:
+        header_idx = None
+        for idx, row in df.iterrows():
+            vals = [str(v).strip() for v in row.tolist()]
+            if "Joint" in vals and "OutputCase" in vals and "F3" in vals:
+                header_idx = idx
+                break
+        if header_idx is None:
+            # Fall back to first row as header for non-standard but table-like files.
+            out = pd.read_excel(raw) if False else df
+            return out
+
+        header = [str(v).strip() if not pd.isna(v) else f"Column {i + 1}" for i, v in enumerate(df.loc[header_idx].tolist())]
+        out = df.loc[header_idx + 1:].copy()
+        out.columns = header
+
+    out = out.dropna(axis=0, how="all")
+    # Remove SAP units row and repeated title/header rows if pasted/exported together.
+    first_col = out.columns[0]
+    mask_units = out[first_col].astype(str).str.strip().str.lower().isin({"text", "joint"})
+    out = out[~mask_units].copy()
+    if "CaseType" in out.columns:
+        out = out[out["CaseType"].astype(str).str.strip().str.lower() != "text"].copy()
+
+    keep = [c for c in expected if c in out.columns]
+    other = [c for c in out.columns if c not in keep]
+    out = out[keep + other].reset_index(drop=True)
+
+    for col in ["F1", "F2", "F3", "M1", "M2", "M3"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    if "Joint" in out.columns:
+        out["Joint"] = out["Joint"].astype(str).str.strip()
+    if "OutputCase" in out.columns:
+        out["OutputCase"] = out["OutputCase"].astype(str).str.strip()
+    if "CaseType" in out.columns:
+        out["CaseType"] = out["CaseType"].astype(str).str.strip()
+    return out
 
 
 def find_matching_column(columns: List[str], aliases: List[str]) -> Optional[str]:
@@ -1296,6 +1664,7 @@ def sap2000_column_map(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     return {
         "joint": find_matching_column(cols, ["Joint", "JointElm", "Point", "PointElm", "Unique Name"]),
         "case": find_matching_column(cols, ["OutputCase", "Load Case", "Case", "LoadCase", "Combo", "Combination"]),
+        "case_type": find_matching_column(cols, ["CaseType", "Case Type", "OutputCaseType"]),
         "step": find_matching_column(cols, ["StepType", "Step", "Step Number", "StepNum"]),
         "F1": find_matching_column(cols, ["F1", "FX", "GlobalFX", "Reaction F1"]),
         "F2": find_matching_column(cols, ["F2", "FY", "GlobalFY", "Reaction F2"]),
@@ -1369,6 +1738,477 @@ def sap_envelope_table(df: pd.DataFrame, cmap: Dict[str, Optional[str]]) -> pd.D
             row[f"{c} max"] = vals.max()
             row[f"{c} min"] = vals.min()
         return pd.DataFrame([row])
+
+
+def parse_joint_list(value: Any) -> List[str]:
+    text = str(value or "").replace(";", ",").replace("\n", ",")
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+
+def group_defaults_from_geometry(geom: Geometry, group_name: str = "Foundation 1", joint_ids: str = "") -> Dict[str, Any]:
+    row = dict(GROUP_DEFAULT_COLUMNS)
+    row.update(
+        {
+            "Group Name": group_name,
+            "Joint IDs": joint_ids,
+            "No. Piles": int(geom.n_piles),
+            "Pile Dia (mm)": geom.pile_diameter_mm,
+            "Spacing X (mm)": geom.spacing_x_mm,
+            "Spacing Y (mm)": geom.spacing_y_mm,
+            "Edge (mm)": geom.edge_from_pile_edge_mm,
+            "Thickness (mm)": geom.cap_thickness_mm,
+            "Pile Comp Cap (kN)": geom.pile_capacity_comp_kN,
+            "Pile Tension Cap (kN)": geom.pile_capacity_tension_kN,
+        }
+    )
+    return row
+
+
+def ensure_group_columns(df: pd.DataFrame, geom: Geometry) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame([group_defaults_from_geometry(geom)])
+    out = df.copy()
+    defaults = group_defaults_from_geometry(geom)
+    for col, default in defaults.items():
+        if col not in out.columns:
+            out[col] = default
+    return out[list(defaults.keys()) + [c for c in out.columns if c not in defaults]]
+
+
+def apply_sidebar_geometry_to_groups(df: pd.DataFrame, geom: Geometry) -> pd.DataFrame:
+    out = ensure_group_columns(df, geom).copy()
+    sidebar_values = group_defaults_from_geometry(geom)
+    for col in [
+        "No. Piles",
+        "Thickness (mm)",
+        "Pile Dia (mm)",
+        "Spacing X (mm)",
+        "Spacing Y (mm)",
+        "Edge (mm)",
+        "Pile Comp Cap (kN)",
+        "Pile Tension Cap (kN)",
+    ]:
+        out[col] = sidebar_values[col]
+    return out
+
+
+def group_geometry_override_warnings(df: pd.DataFrame, geom: Geometry) -> List[str]:
+    if df is None or df.empty:
+        return []
+    checks = [
+        ("No. Piles", geom.n_piles),
+        ("Thickness (mm)", geom.cap_thickness_mm),
+        ("Pile Dia (mm)", geom.pile_diameter_mm),
+        ("Spacing X (mm)", geom.spacing_x_mm),
+        ("Spacing Y (mm)", geom.spacing_y_mm),
+        ("Edge (mm)", geom.edge_from_pile_edge_mm),
+        ("Pile Comp Cap (kN)", geom.pile_capacity_comp_kN),
+        ("Pile Tension Cap (kN)", geom.pile_capacity_tension_kN),
+    ]
+    notes = []
+    for _, row in df.iterrows():
+        name = str(row.get("Group Name", "Foundation")).strip() or "Foundation"
+        diffs = []
+        for col, sidebar_value in checks:
+            if col in df.columns and abs(safe_float(row.get(col), sidebar_value) - float(sidebar_value)) > 1e-6:
+                diffs.append(f"{col}: table {safe_float(row.get(col)):.0f}, sidebar {float(sidebar_value):.0f}")
+        if diffs:
+            notes.append(f"{name} is using table geometry overrides. Press APPLY to replace them with sidebar values. ({'; '.join(diffs)})")
+    return notes
+
+
+def geometry_from_group_row(base: Geometry, row: pd.Series) -> Geometry:
+    return replace(
+        base,
+        n_piles=int(max(2, min(12, round(safe_float(row.get("No. Piles", base.n_piles), base.n_piles))))),
+        pile_diameter_mm=safe_float(row.get("Pile Dia (mm)", base.pile_diameter_mm), base.pile_diameter_mm),
+        spacing_x_mm=safe_float(row.get("Spacing X (mm)", base.spacing_x_mm), base.spacing_x_mm),
+        spacing_y_mm=safe_float(row.get("Spacing Y (mm)", base.spacing_y_mm), base.spacing_y_mm),
+        edge_from_pile_edge_mm=safe_float(row.get("Edge (mm)", base.edge_from_pile_edge_mm), base.edge_from_pile_edge_mm),
+        cap_thickness_mm=safe_float(row.get("Thickness (mm)", base.cap_thickness_mm), base.cap_thickness_mm),
+        pile_capacity_comp_kN=safe_float(row.get("Pile Comp Cap (kN)", base.pile_capacity_comp_kN), base.pile_capacity_comp_kN),
+        pile_capacity_tension_kN=safe_float(row.get("Pile Tension Cap (kN)", base.pile_capacity_tension_kN), base.pile_capacity_tension_kN),
+    )
+
+
+def piles_from_group_geometry(geom: Geometry) -> List[PilePoint]:
+    return make_piles(geom.n_piles, geom.spacing_x_mm, geom.spacing_y_mm, geom.pile_diameter_mm)
+
+
+def default_sap_groups(df: pd.DataFrame, cmap: Dict[str, Optional[str]], geom: Geometry) -> pd.DataFrame:
+    joint_col = cmap.get("joint")
+    if df is None or df.empty or not joint_col or joint_col not in df.columns:
+        return pd.DataFrame([group_defaults_from_geometry(geom, "Foundation 1", "")])
+    joints = sorted({str(v).strip() for v in df[joint_col].dropna().tolist() if str(v).strip()})
+    return pd.DataFrame([group_defaults_from_geometry(geom, "Foundation 1", ", ".join(joints[:12]))])
+
+
+def default_manual_foundations(geom: Geometry) -> pd.DataFrame:
+    row = group_defaults_from_geometry(geom, "Foundation 1", "")
+    row.update(MANUAL_SERVICE_LOAD_DEFAULTS)
+    return pd.DataFrame([row])
+
+
+def normalize_manual_service_load_columns(df: pd.DataFrame) -> pd.DataFrame:
+    work = df.copy()
+    for new_col, aliases in MANUAL_SERVICE_LOAD_ALIASES.items():
+        if new_col not in work.columns:
+            for old_col in aliases:
+                if old_col in work.columns:
+                    work[new_col] = work[old_col]
+                    break
+        if new_col not in work.columns:
+            work[new_col] = MANUAL_SERVICE_LOAD_DEFAULTS.get(new_col, 0.0)
+    for col, default in MANUAL_SERVICE_LOAD_DEFAULTS.items():
+        if col not in work.columns:
+            work[col] = default
+
+    old_load_cols = {old_col for aliases in MANUAL_SERVICE_LOAD_ALIASES.values() for old_col in aliases}
+    work = work.drop(columns=[col for col in old_load_cols if col in work.columns], errors="ignore")
+
+    preferred_order = list(GROUP_DEFAULT_COLUMNS.keys()) + list(MANUAL_SERVICE_LOAD_DEFAULTS.keys())
+    ordered_cols = [col for col in preferred_order if col in work.columns]
+    ordered_cols += [col for col in work.columns if col not in ordered_cols]
+    return work[ordered_cols]
+
+
+def manual_service_ultimate_loadcases(row: pd.Series, group_name: str) -> Tuple[LoadCase, LoadCase]:
+    d_ps = safe_float(row.get("D Ps (kN)", row.get("D Pu (kN)", row.get("Pu (kN)", 0.0))))
+    d_msx = safe_float(row.get("D Msx (kN-m)", row.get("D Mux (kN-m)", row.get("Mux (kN-m)", 0.0))))
+    d_msy = safe_float(row.get("D Msy (kN-m)", row.get("D Muy (kN-m)", row.get("Muy (kN-m)", 0.0))))
+    l_ps = safe_float(row.get("L Ps (kN)", row.get("L Pu (kN)", 0.0)))
+    l_msx = safe_float(row.get("L Msx (kN-m)", row.get("L Mux (kN-m)", 0.0)))
+    l_msy = safe_float(row.get("L Msy (kN-m)", row.get("L Muy (kN-m)", 0.0)))
+    fd = safe_float(row.get("D Factor", 1.2), 1.2)
+    fl = safe_float(row.get("L Factor", 1.6), 1.6)
+    service = LoadCase(
+        name=f"{group_name} - Service D+L",
+        Pu_kN=d_ps + l_ps,
+        Mux_kNm=d_msx + l_msx,
+        Muy_kNm=d_msy + l_msy,
+    )
+    ultimate = LoadCase(
+        name=f"{group_name} - Ultimate {fd:g}D+{fl:g}L",
+        Pu_kN=fd * d_ps + fl * l_ps,
+        Mux_kNm=fd * d_msx + fl * l_msx,
+        Muy_kNm=fd * d_msy + fl * l_msy,
+    )
+    return service, ultimate
+
+
+def sap_loadcases_from_rows(
+    df: pd.DataFrame,
+    cmap: Dict[str, Optional[str]],
+    vertical_col: str,
+    mx_col: str,
+    my_col: str,
+    vx_col: Optional[str],
+    vy_col: Optional[str],
+    torsion_col: Optional[str],
+    vertical_sign: float,
+    moment_sign: float,
+    group_name: str = "",
+) -> List[LoadCase]:
+    if df is None or df.empty:
+        return []
+    case_col = cmap.get("case")
+    case_type_col = cmap.get("case_type")
+    joint_col = cmap.get("joint")
+    value_cols = [vertical_col, mx_col, my_col, vx_col, vy_col, torsion_col]
+    value_cols = [c for c in value_cols if c and c in df.columns]
+    work = df.copy()
+    for col in value_cols:
+        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0.0)
+
+    # A selected group usually represents a foundation type, not one physical
+    # cap combining every selected SAP joint. Keep each Joint+OutputCase as a
+    # separate design case and envelope the results. Sum only duplicate rows
+    # for the same joint and output case, for example step/table duplicates.
+    group_cols = []
+    if joint_col and joint_col in work.columns:
+        group_cols.append(joint_col)
+    if case_col and case_col in work.columns:
+        group_cols.append(case_col)
+    if case_type_col and case_type_col in work.columns:
+        group_cols.append(case_type_col)
+    grouped = work.groupby(group_cols, dropna=False)[value_cols].sum().reset_index() if group_cols else work
+
+    out = []
+    for idx, row in grouped.iterrows():
+        parts = []
+        if joint_col and joint_col in grouped.columns:
+            parts.append(f"J{str(row.get(joint_col)).strip()}")
+        if case_col and case_col in grouped.columns:
+            parts.append(str(row.get(case_col)).strip())
+        if not parts:
+            parts.append(f"SAP row {idx}")
+        case_name = " - ".join(parts)
+        out.append(
+            build_loadcase_from_sap_row(
+                row=row,
+                cmap=cmap,
+                vertical_col=vertical_col,
+                mx_col=mx_col,
+                my_col=my_col,
+                vx_col=vx_col,
+                vy_col=vy_col,
+                torsion_col=torsion_col,
+                vertical_sign=vertical_sign,
+                moment_sign=moment_sign,
+                name=case_name,
+            )
+        )
+    return out
+
+
+def prepare_design_state(
+    mat: Material,
+    geom: Geometry,
+    reinf: Reinforcement,
+    piles_base: List[PilePoint],
+    loadcase: LoadCase,
+    include_self_weight: bool,
+) -> Tuple[DesignState, Dict[str, Any]]:
+    cap_x, cap_y = cap_dimensions_from_piles(piles_base, geom.edge_from_pile_edge_mm)
+    sw = self_weight_cap_kN(cap_x, cap_y, geom.cap_thickness_mm, mat.gamma_conc_kN_m3)
+    self_weight = sw if include_self_weight else 0.0
+    total_Pu = loadcase.Pu_kN + self_weight
+    piles_with_reactions = distribute_vertical_load_to_piles(
+        piles_base,
+        total_Pu,
+        loadcase.Mux_kNm,
+        loadcase.Muy_kNm,
+    )
+    state = DesignState(
+        material=mat,
+        geometry=geom,
+        reinforcement=reinf,
+        loadcase=loadcase,
+        piles=piles_with_reactions,
+        cap_length_x_mm=cap_x,
+        cap_width_y_mm=cap_y,
+        effective_depth_x_mm=effective_depths(geom, reinf)[0],
+        effective_depth_y_mm=effective_depths(geom, reinf)[1],
+        self_weight_kN=self_weight,
+    )
+    return state, design_all(state, use_self_weight=include_self_weight)
+
+
+def max_check_ratio(results: Dict[str, Any]) -> float:
+    return max([c.ratio for c in results.get("checks", []) if np.isfinite(c.ratio)] + [0.0])
+
+
+def design_input_signature(
+    mat: Material,
+    geom: Geometry,
+    reinf: Reinforcement,
+    include_self_weight: bool,
+    load_input: Dict[str, Any],
+) -> str:
+    groups = load_input.get("groups", pd.DataFrame())
+    groups_json = groups.to_json(orient="split", default_handler=str) if isinstance(groups, pd.DataFrame) else ""
+    payload = {
+        "material": asdict(mat),
+        "geometry": asdict(geom),
+        "reinforcement": asdict(reinf),
+        "include_self_weight": include_self_weight,
+        "mode": load_input.get("mode"),
+        "groups": groups_json,
+        "sap_rows": len(load_input.get("sap_df", pd.DataFrame())) if isinstance(load_input.get("sap_df", None), pd.DataFrame) else 0,
+    }
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
+def pile_spacing_warnings(geom: Geometry) -> List[str]:
+    notes = []
+    if geom.spacing_x_mm < 3.0 * geom.pile_diameter_mm:
+        notes.append("Spacing X is less than 3D; check pile clear spacing and group effects.")
+    if geom.spacing_y_mm < 3.0 * geom.pile_diameter_mm:
+        notes.append("Spacing Y is less than 3D; check pile clear spacing and group effects.")
+    if geom.edge_from_pile_edge_mm < 0.5 * geom.pile_diameter_mm:
+        notes.append("Edge distance is less than 0.5D from pile edge; verify detailing and concrete breakout.")
+    return notes
+
+
+def is_service_loadcase(loadcase: LoadCase) -> bool:
+    return "CS-" in str(loadcase.name).upper()
+
+
+def is_ultimate_loadcase(loadcase: LoadCase) -> bool:
+    return "CU-" in str(loadcase.name).upper()
+
+
+def envelope_group_design(
+    group_name: str,
+    loadcases: List[LoadCase],
+    mat: Material,
+    geom: Geometry,
+    reinf: Reinforcement,
+    piles_base: List[PilePoint],
+    include_self_weight: bool,
+    service_loadcases: Optional[List[LoadCase]] = None,
+    ultimate_loadcases: Optional[List[LoadCase]] = None,
+) -> Dict[str, Any]:
+    service_cases = service_loadcases if service_loadcases is not None else [lc for lc in loadcases if is_service_loadcase(lc)]
+    ultimate_cases = ultimate_loadcases if ultimate_loadcases is not None else [lc for lc in loadcases if is_ultimate_loadcase(lc)]
+    if not service_cases:
+        service_cases = loadcases
+    if not ultimate_cases:
+        ultimate_cases = loadcases
+
+    service_runs = []
+    for lc in service_cases:
+        state, results = prepare_design_state(mat, geom, reinf, piles_base, lc, include_self_weight)
+        service_runs.append({"group": group_name, "loadcase": lc.name, "state": state, "results": results})
+
+    rc_runs = []
+    for lc in ultimate_cases:
+        state, results = prepare_design_state(mat, geom, reinf, piles_base, lc, include_self_weight)
+        rc_runs.append({"group": group_name, "loadcase": lc.name, "state": state, "results": results})
+
+    if not service_runs:
+        state, results = prepare_design_state(mat, geom, reinf, piles_base, LoadCase(name=f"{group_name} - default"), include_self_weight)
+        service_runs.append({"group": group_name, "loadcase": state.loadcase.name, "state": state, "results": results})
+    if not rc_runs:
+        rc_runs = service_runs
+
+    def governing(metric):
+        return max(rc_runs, key=lambda r: metric(r["results"], r["state"]))
+
+    overall = governing(lambda res, _state: max_check_ratio(res))
+    flex_x_gov = governing(lambda res, _state: res["flex_x"]["As_req_mm2"])
+    flex_y_gov = governing(lambda res, _state: res["flex_y"]["As_req_mm2"])
+    top_x_gov = governing(lambda res, _state: res["moment_demands"]["M_for_X_bars_kNm"] / max(res["top_cap_xbars"]["phiMn_kNm"], 1e-9))
+    top_y_gov = governing(lambda res, _state: res["moment_demands"]["M_for_Y_bars_kNm"] / max(res["top_cap_ybars"]["phiMn_kNm"], 1e-9))
+    punch_gov = governing(lambda res, _state: res["punch_demand"]["Vu_punch_kN"] / max(res["punch_cap"]["phiVc_kN"], 1e-9))
+    shear_x_gov = governing(lambda res, _state: res["shear_demands"]["V_for_X_bars_direction_kN"] / max(res["one_way_x"]["phiVc_kN"], 1e-9))
+    shear_y_gov = governing(lambda res, _state: res["shear_demands"]["V_for_Y_bars_direction_kN"] / max(res["one_way_y"]["phiVc_kN"], 1e-9))
+
+    pile_rows = []
+    labels = [p.label for p in piles_base]
+    for label in labels:
+        vals = []
+        coords = None
+        dia = geom.pile_diameter_mm
+        for run in service_runs:
+            pile = next((p for p in run["state"].piles if p.label == label), None)
+            if pile is None:
+                continue
+            vals.append((pile.reaction_kN, run["loadcase"]))
+            coords = (pile.x_mm, pile.y_mm)
+            dia = pile.diameter_mm
+        if not vals:
+            continue
+        comp = max(vals, key=lambda item: item[0])
+        ten = min(vals, key=lambda item: item[0])
+        pile_rows.append(
+            {
+                "Group": group_name,
+                "Pile": label,
+                "x (mm)": coords[0] if coords else 0.0,
+                "y (mm)": coords[1] if coords else 0.0,
+                "Max compression (kN)": max(comp[0], 0.0),
+                "Compression combo": comp[1],
+                "Max uplift (kN)": max(-ten[0], 0.0),
+                "Uplift combo": ten[1],
+                "Compression ratio": max(comp[0], 0.0) / max(geom.pile_capacity_comp_kN, 1e-9),
+                "Tension ratio": max(-ten[0], 0.0) / max(geom.pile_capacity_tension_kN, 1e-9),
+                "diameter_mm": dia,
+            }
+        )
+
+    display_state = overall["state"]
+    comp_piles = []
+    for row in pile_rows:
+        comp_piles.append(PilePoint(row["Pile"], row["x (mm)"], row["y (mm)"], row["diameter_mm"], row["Max compression (kN)"]))
+    display_state = DesignState(
+        material=display_state.material,
+        geometry=display_state.geometry,
+        reinforcement=display_state.reinforcement,
+        loadcase=LoadCase(name=f"{group_name} envelope", Pu_kN=display_state.loadcase.Pu_kN, Mux_kNm=display_state.loadcase.Mux_kNm, Muy_kNm=display_state.loadcase.Muy_kNm),
+        piles=comp_piles or display_state.piles,
+        cap_length_x_mm=display_state.cap_length_x_mm,
+        cap_width_y_mm=display_state.cap_width_y_mm,
+        effective_depth_x_mm=display_state.effective_depth_x_mm,
+        effective_depth_y_mm=display_state.effective_depth_y_mm,
+        self_weight_kN=display_state.self_weight_kN,
+    )
+
+    summary = {
+        "Group": group_name,
+        "No. Piles": geom.n_piles,
+        "Pile Dia (mm)": geom.pile_diameter_mm,
+        "Cap X (mm)": display_state.cap_length_x_mm,
+        "Cap Y (mm)": display_state.cap_width_y_mm,
+        "Thickness (mm)": geom.cap_thickness_mm,
+        "Geometry warnings": "; ".join(pile_spacing_warnings(geom)),
+        "Service cases checked": len(service_runs),
+        "Ultimate cases checked": len(rc_runs),
+        "RC governing combo": overall["loadcase"],
+        "Max D/C": max_check_ratio(overall["results"]),
+        "X bars governing combo": flex_x_gov["loadcase"],
+        "X bars As req (mm2)": flex_x_gov["results"]["flex_x"]["As_req_mm2"],
+        "Y bars governing combo": flex_y_gov["loadcase"],
+        "Y bars As req (mm2)": flex_y_gov["results"]["flex_y"]["As_req_mm2"],
+        "Top X governing combo": top_x_gov["loadcase"],
+        "Top X D/C": top_x_gov["results"]["moment_demands"]["M_for_X_bars_kNm"] / max(top_x_gov["results"]["top_cap_xbars"]["phiMn_kNm"], 1e-9),
+        "Top Y governing combo": top_y_gov["loadcase"],
+        "Top Y D/C": top_y_gov["results"]["moment_demands"]["M_for_Y_bars_kNm"] / max(top_y_gov["results"]["top_cap_ybars"]["phiMn_kNm"], 1e-9),
+        "Punching governing combo": punch_gov["loadcase"],
+        "Punching D/C": punch_gov["results"]["punch_demand"]["Vu_punch_kN"] / max(punch_gov["results"]["punch_cap"]["phiVc_kN"], 1e-9),
+        "One-way X governing combo": shear_x_gov["loadcase"],
+        "One-way Y governing combo": shear_y_gov["loadcase"],
+    }
+    display_results = dict(overall["results"])
+    for key in ["flex_x", "spacing_x", "cap_xbars"]:
+        display_results[key] = flex_x_gov["results"][key]
+    for key in ["flex_y", "spacing_y", "cap_ybars"]:
+        display_results[key] = flex_y_gov["results"][key]
+    for key in ["top_flex_x", "top_spacing_x", "top_cap_xbars", "d_top_x_mm", "ld_top_mm", "ld_top"]:
+        display_results[key] = top_x_gov["results"][key]
+    for key in ["top_flex_y", "top_spacing_y", "top_cap_ybars", "d_top_y_mm"]:
+        display_results[key] = top_y_gov["results"][key]
+    for key in ["punch_demand", "punch_cap"]:
+        display_results[key] = punch_gov["results"][key]
+    display_results["one_way_x"] = shear_x_gov["results"]["one_way_x"]
+    display_results["one_way_y"] = shear_y_gov["results"]["one_way_y"]
+    display_results["shear_demands"] = dict(overall["results"]["shear_demands"])
+    display_results["shear_demands"]["V_for_X_bars_direction_kN"] = shear_x_gov["results"]["shear_demands"]["V_for_X_bars_direction_kN"]
+    display_results["shear_demands"]["V_for_Y_bars_direction_kN"] = shear_y_gov["results"]["shear_demands"]["V_for_Y_bars_direction_kN"]
+    display_results["governing_combos"] = {
+        "pile_service": max(pile_rows, key=lambda row: row["Max compression (kN)"])["Compression combo"] if pile_rows else "-",
+        "rc_overall": overall["loadcase"],
+        "flex_x_ultimate": flex_x_gov["loadcase"],
+        "flex_y_ultimate": flex_y_gov["loadcase"],
+        "top_flex_x_ultimate": top_x_gov["loadcase"],
+        "top_flex_y_ultimate": top_y_gov["loadcase"],
+        "punching_ultimate": punch_gov["loadcase"],
+        "one_way_x_ultimate": shear_x_gov["loadcase"],
+        "one_way_y_ultimate": shear_y_gov["loadcase"],
+    }
+    max_comp = max([row["Max compression (kN)"] for row in pile_rows] + [0.0])
+    max_uplift = max([row["Max uplift (kN)"] for row in pile_rows] + [0.0])
+    envelope_checks = []
+    for check in overall["results"]["checks"]:
+        if check.name == "Pile compression":
+            ratio = max_comp / max(geom.pile_capacity_comp_kN, 1e-9)
+            envelope_checks.append(CheckResult(check.name, max_comp, geom.pile_capacity_comp_kN, ratio, "kN", status_from_ratio(ratio), "Envelope maximum compression pile reaction."))
+        elif check.name == "Pile tension/uplift":
+            ratio = max_uplift / max(geom.pile_capacity_tension_kN, 1e-9)
+            envelope_checks.append(CheckResult(check.name, max_uplift, geom.pile_capacity_tension_kN, ratio, "kN", status_from_ratio(ratio), "Envelope maximum uplift pile reaction."))
+        else:
+            envelope_checks.append(check)
+    display_results["checks"] = envelope_checks
+    return {
+        "group": group_name,
+        "runs": rc_runs,
+        "service_runs": service_runs,
+        "ultimate_runs": rc_runs,
+        "state": display_state,
+        "results": display_results,
+        "summary": summary,
+        "pile_envelope": pd.DataFrame(pile_rows),
+    }
 
 
 # =============================================================================
@@ -1508,7 +2348,7 @@ def plot_elevation(state: DesignState, results: Dict[str, Any], direction: str =
 
     bot_label = f"BOT. MAIN {reinf.main_bar_x if direction.upper() == 'X' else reinf.main_bar_y}"
     ax.text(-cap_x / 2 + 80, cover_bot + 60, bot_label, fontsize=8)
-    ax.text(-cap_x / 2 + 80, thickness - cover_top - 100, f"TOP TEMP. {reinf.top_bar}@{reinf.top_spacing_mm:.0f}", fontsize=8)
+    ax.text(-cap_x / 2 + 80, thickness - cover_top - 100, f"TOP BARS {reinf.top_bar}@{reinf.top_spacing_mm:.0f}", fontsize=8)
 
     # Depth dimension
     add_dim_line(ax, (cap_x / 2, 0), (cap_x / 2, thickness), f"h = {thickness:.0f}", offset=(250, 0), text_offset=(70, 0))
@@ -1607,8 +2447,10 @@ def make_markdown_report(state: DesignState, results: Dict[str, Any]) -> str:
     lines.append("## Main Reinforcement")
     lines.append(f"- Bottom X bars: {state.reinforcement.main_bar_x} @ {results['spacing_x']['spacing_use_mm']:.0f} mm")
     lines.append(f"- Bottom Y bars: {state.reinforcement.main_bar_y} @ {results['spacing_y']['spacing_use_mm']:.0f} mm")
-    lines.append(f"- Development estimate X bars = {results['ld_x_mm']:.0f} mm")
-    lines.append(f"- Development estimate Y bars = {results['ld_y_mm']:.0f} mm")
+    lines.append(f"- Top X/Y bars: {state.reinforcement.top_bar} @ {results['top_spacing_x']['spacing_use_mm']:.0f} mm")
+    lines.append(f"- Development estimate X bars = {results['ld_x_mm']:.0f} mm (cb/db factor {results['ld_x']['confinement_factor']:.2f})")
+    lines.append(f"- Development estimate Y bars = {results['ld_y_mm']:.0f} mm (cb/db factor {results['ld_y']['confinement_factor']:.2f})")
+    lines.append(f"- Development estimate top bars = {results['ld_top_mm']:.0f} mm (cb/db factor {results['ld_top']['confinement_factor']:.2f})")
     lines.append("")
     lines.append("## Check Summary")
     lines.append(dataframe_to_markdown_table(checks_df))
@@ -1621,6 +2463,8 @@ def make_markdown_report(state: DesignState, results: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("## Notes")
     lines.append("- Verify ACI 318-25 clauses directly for final design.")
+    lines.append("- Shear capacities include lambda_s size effect; punching uses the least of upper-limit, beta, and alpha_s expressions.")
+    lines.append("- Pile reactions near the punching perimeter are linearly reduced over one pile radius each side of the critical section.")
     lines.append("- For pile caps with small shear span-to-depth ratio, use a full strut-and-tie model.")
     lines.append("- For seismic regions, pile anchorage, confinement, tie forces, shear friction, and ductile detailing may govern.")
     lines.append("- Check geotechnical pile compression, uplift, lateral load, settlement, group effects, and construction tolerances.")
@@ -1732,11 +2576,13 @@ def make_fallback_calculation_pdf(state: DesignState, results: Dict[str, Any]) -
             "Reinforcement Summary",
             f"X bars: {state.reinforcement.main_bar_x} @ {results['spacing_x']['spacing_use_mm']:.0f} mm, As req {results['flex_x']['As_req_mm2']:.0f} mm2",
             f"Y bars: {state.reinforcement.main_bar_y} @ {results['spacing_y']['spacing_use_mm']:.0f} mm, As req {results['flex_y']['As_req_mm2']:.0f} mm2",
+            f"Top X/Y bars: {state.reinforcement.top_bar} @ {results['top_spacing_x']['spacing_use_mm']:.0f} mm, As req X/Y {results['top_flex_x']['As_req_mm2']:.0f}/{results['top_flex_y']['As_req_mm2']:.0f} mm2",
             "",
             "Formula Notes",
             "R_i = P/n + Mx*y_i/sum(y^2) + My*x_i/sum(x^2)",
             "Flexure: phi As fy (d - a/2) >= Mu",
-            "One-way shear and punching use simplified ACI-style concrete expressions.",
+            "One-way shear includes rho_w and lambda_s; punching uses beta, alpha_s, and upper-limit expressions.",
+            "Top flexure is checked from M1/M2 pile-cap bending demand with uplift and lateral effects neglected.",
             "Lateral load and torsion are flagged separately and need project-specific checks.",
         ]
     )
@@ -1797,8 +2643,10 @@ def make_calculation_pdf(state: DesignState, results: Dict[str, Any]) -> bytes:
     pdf.cell(0, 7, "Reinforcement Summary", ln=True)
     reinf_df = pd.DataFrame(
         [
-            {"Direction": "X bars", "Bar": state.reinforcement.main_bar_x, "As req": results["flex_x"]["As_req_mm2"], "Use spacing": results["spacing_x"]["spacing_use_mm"], "As prov": results["spacing_x"]["As_prov_mm2"], "phiMn": results["cap_xbars"]["phiMn_kNm"]},
-            {"Direction": "Y bars", "Bar": state.reinforcement.main_bar_y, "As req": results["flex_y"]["As_req_mm2"], "Use spacing": results["spacing_y"]["spacing_use_mm"], "As prov": results["spacing_y"]["As_prov_mm2"], "phiMn": results["cap_ybars"]["phiMn_kNm"]},
+            {"Direction": "Bottom X bars", "Bar": state.reinforcement.main_bar_x, "As req": results["flex_x"]["As_req_mm2"], "Use spacing": results["spacing_x"]["spacing_use_mm"], "As prov": results["spacing_x"]["As_prov_mm2"], "phiMn": results["cap_xbars"]["phiMn_kNm"]},
+            {"Direction": "Bottom Y bars", "Bar": state.reinforcement.main_bar_y, "As req": results["flex_y"]["As_req_mm2"], "Use spacing": results["spacing_y"]["spacing_use_mm"], "As prov": results["spacing_y"]["As_prov_mm2"], "phiMn": results["cap_ybars"]["phiMn_kNm"]},
+            {"Direction": "Top X bars", "Bar": state.reinforcement.top_bar, "As req": results["top_flex_x"]["As_req_mm2"], "Use spacing": results["top_spacing_x"]["spacing_use_mm"], "As prov": results["top_spacing_x"]["As_prov_mm2"], "phiMn": results["top_cap_xbars"]["phiMn_kNm"]},
+            {"Direction": "Top Y bars", "Bar": state.reinforcement.top_bar, "As req": results["top_flex_y"]["As_req_mm2"], "Use spacing": results["top_spacing_y"]["spacing_use_mm"], "As prov": results["top_spacing_y"]["As_prov_mm2"], "phiMn": results["top_cap_ybars"]["phiMn_kNm"]},
         ]
     )
     pdf_add_table(pdf, reinf_df, ["Direction", "Bar", "As req", "Use spacing", "As prov", "phiMn"], [30, 22, 28, 30, 28, 28])
@@ -1813,9 +2661,11 @@ def make_calculation_pdf(state: DesignState, results: Dict[str, Any]) -> bytes:
         pdf_safe(
             "Pile reaction: R_i = P/n + Mx*y_i/sum(y^2) + My*x_i/sum(x^2)\n"
             "Flexure: phi * As * fy * (d - a/2) >= Mu; a = As*fy/(0.85*fc'*b)\n"
-            "One-way shear: phi Vc = phi * 0.17 * lambda * sqrt(fc') * b * d\n"
-            "Two-way punching: phi Vc = phi * 0.33 * lambda * sqrt(fc') * bo * d\n"
+            "One-way shear: phi Vc = phi * [0.66*lambda_s*lambda*rho_w^(1/3)*sqrt(fc') + Nu/(6Ag)] * b * d, capped by vc <= 0.42*lambda*sqrt(fc')\n"
+            "Two-way punching: phi Vc = phi * min(vc_a, vc_b, vc_c) * bo * d using lambda_s, beta, and alpha_s terms\n"
+            "Punching demand: pile reactions near the critical perimeter are linearly proportioned over +/- pile radius\n"
             "STM advisory: theta = atan(d/a), T_est = R*cot(theta)\n\n"
+            "Top flexure is checked from M1/M2 pile-cap bending demand with uplift and lateral effects neglected.\n"
             "Lateral load and torsion are flagged separately. Add project-specific lateral pile group and torsional checks before using those actions for final design."
         ),
     )
@@ -1875,6 +2725,9 @@ def sidebar_inputs() -> Tuple[Material, Geometry, Reinforcement, bool]:
             ped_bx = st.number_input("Pedestal / loaded area Bx (mm)", min_value=200.0, max_value=6000.0, value=saved_float("geometry", "pedestal_bx_mm", 800.0), step=50.0)
             ped_by = st.number_input("Pedestal / loaded area By (mm)", min_value=200.0, max_value=6000.0, value=saved_float("geometry", "pedestal_by_mm", 800.0), step=50.0)
             use_ped = st.toggle("Use pedestal size for shear/bearing checks", value=saved_bool("geometry", "use_pedestal_for_shear", True))
+            loc_options = ["Interior", "Edge", "Corner"]
+            loc_default = saved_choice("geometry", "column_location", "Interior", loc_options)
+            column_location = st.selectbox("Column location for punching alpha_s", loc_options, index=loc_options.index(loc_default))
 
         with st.expander("Concrete Cover and Reinforcement", expanded=True):
             bot_cover = st.number_input("Bottom cover (mm)", min_value=40.0, max_value=300.0, value=saved_float("geometry", "bottom_cover_mm", 100.0), step=5.0)
@@ -1883,10 +2736,12 @@ def sidebar_inputs() -> Tuple[Material, Geometry, Reinforcement, bool]:
             bars = list(BAR_DATABASE_MM.keys())
             main_x_default = saved_choice("reinforcement", "main_bar_x", "DB25", bars)
             main_x = st.selectbox("Bottom bars parallel X", bars, index=bars.index(main_x_default))
+            main_x_spacing = st.number_input("Bottom X bar spacing (mm)", min_value=75.0, max_value=400.0, value=saved_float("reinforcement", "spacing_x_mm", 150.0), step=25.0)
             main_y_default = saved_choice("reinforcement", "main_bar_y", "DB25", bars)
             main_y = st.selectbox("Bottom bars parallel Y", bars, index=bars.index(main_y_default))
+            main_y_spacing = st.number_input("Bottom Y bar spacing (mm)", min_value=75.0, max_value=400.0, value=saved_float("reinforcement", "spacing_y_mm", 150.0), step=25.0)
             top_bar_default = saved_choice("reinforcement", "top_bar", "DB16", bars)
-            top_bar = st.selectbox("Top temperature bars", bars, index=bars.index(top_bar_default))
+            top_bar = st.selectbox("Top bars / nominal top reinforcement", bars, index=bars.index(top_bar_default))
             top_spacing = st.number_input("Top bar spacing (mm)", min_value=75.0, max_value=400.0, value=saved_float("reinforcement", "top_spacing_mm", 200.0), step=25.0)
             side_bar_default = saved_choice("reinforcement", "side_face_bar", "DB16", bars)
             side_bar = st.selectbox("Side face bars", bars, index=bars.index(side_bar_default))
@@ -1918,11 +2773,14 @@ def sidebar_inputs() -> Tuple[Material, Geometry, Reinforcement, bool]:
         spacing_x_mm=sx,
         spacing_y_mm=sy,
         use_pedestal_for_shear=use_ped,
+        column_location=column_location,
     )
     reinf = Reinforcement(
         main_bar_x=main_x,
         main_bar_y=main_y,
         top_bar=top_bar,
+        spacing_x_mm=main_x_spacing,
+        spacing_y_mm=main_y_spacing,
         top_spacing_mm=top_spacing,
         side_face_bar=side_bar,
         side_face_spacing_mm=side_spacing,
@@ -1930,31 +2788,85 @@ def sidebar_inputs() -> Tuple[Material, Geometry, Reinforcement, bool]:
     return mat, geom, reinf, include_self_weight
 
 
-def load_input_ui() -> LoadCase:
+def foundation_group_column_config() -> Dict[str, Any]:
+    return {
+        "Group Name": st.column_config.TextColumn("Foundation / Group Name", required=True),
+        "Joint IDs": st.column_config.TextColumn("SAP Joint IDs, comma separated"),
+        "No. Piles": st.column_config.NumberColumn("No. Piles", min_value=2, max_value=12, step=1),
+        "Thickness (mm)": st.column_config.NumberColumn("Thickness (mm)", min_value=300.0, max_value=4000.0, step=50.0),
+        "Pile Dia (mm)": st.column_config.NumberColumn("Pile Dia (mm)", min_value=200.0, max_value=2500.0, step=50.0),
+        "Spacing X (mm)": st.column_config.NumberColumn("Spacing X (mm)", min_value=500.0, max_value=6000.0, step=50.0),
+        "Spacing Y (mm)": st.column_config.NumberColumn("Spacing Y (mm)", min_value=500.0, max_value=6000.0, step=50.0),
+        "Edge (mm)": st.column_config.NumberColumn("Edge (mm)", min_value=100.0, max_value=2000.0, step=50.0),
+        "Pile Comp Cap (kN)": st.column_config.NumberColumn("Pile Comp Cap (kN)", min_value=1.0, max_value=50000.0, step=50.0),
+        "Pile Tension Cap (kN)": st.column_config.NumberColumn("Pile Tension Cap (kN)", min_value=0.0, max_value=50000.0, step=25.0),
+    }
+
+
+def load_input_ui(geom: Geometry) -> Dict[str, Any]:
     st.subheader("Load Input")
     mode = st.radio("Load source", ["Manual input", "SAP2000 joint reaction import"], horizontal=True)
 
     if mode == "Manual input":
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            name = st.text_input("Load case name", value=str(value_from_saved("loadcase", "name", "ULS-Manual")))
-            Pu = st.number_input("Pu compression + (kN)", value=saved_float("loadcase", "Pu_kN", 5000.0), step=100.0)
-        with c2:
-            Mux = st.number_input("Mux about X (kN-m)", value=saved_float("loadcase", "Mux_kNm", 0.0), step=50.0)
-            Muy = st.number_input("Muy about Y (kN-m)", value=saved_float("loadcase", "Muy_kNm", 0.0), step=50.0)
-        with c3:
-            Vux = st.number_input("Vux (kN)", value=saved_float("loadcase", "Vux_kN", 0.0), step=25.0)
-            Vuy = st.number_input("Vuy (kN)", value=saved_float("loadcase", "Vuy_kN", 0.0), step=25.0)
-            Tuz = st.number_input("Tuz (kN-m)", value=saved_float("loadcase", "Tuz_kNm", 0.0), step=25.0)
-        return LoadCase(name=name, Pu_kN=Pu, Mux_kNm=Mux, Muy_kNm=Muy, Vux_kN=Vux, Vuy_kN=Vuy, Tuz_kNm=Tuz)
+        st.caption("Add one row per foundation. Enter service loads only; the app multiplies them by the Dead/Live factors to create ultimate loads for RC checks.")
+        if "manual_foundations_df" not in st.session_state:
+            saved_groups = (st.session_state.get("saved_state_payload") or {}).get("groups", pd.DataFrame())
+            has_manual_loads = isinstance(saved_groups, pd.DataFrame) and not saved_groups.empty and any(
+                col in saved_groups.columns for col in ["D Ps (kN)", "D Pu (kN)", "Pu (kN)"]
+            )
+            if has_manual_loads:
+                st.session_state["manual_foundations_df"] = normalize_manual_service_load_columns(ensure_group_columns(saved_groups, geom))
+            else:
+                st.session_state["manual_foundations_df"] = default_manual_foundations(geom)
+        if st.button("APPLY geometry to table", key="apply_manual_sidebar_geometry", use_container_width=True):
+            st.session_state["manual_foundations_df"] = normalize_manual_service_load_columns(
+                apply_sidebar_geometry_to_groups(st.session_state["manual_foundations_df"], geom)
+            )
+            st.success("Sidebar pile/cap geometry applied to all foundation rows.")
+        st.session_state["manual_foundations_df"] = normalize_manual_service_load_columns(st.session_state["manual_foundations_df"])
+        for note in group_geometry_override_warnings(st.session_state["manual_foundations_df"], geom):
+            st.warning(note)
+        manual_df = st.data_editor(
+            st.session_state["manual_foundations_df"],
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                **foundation_group_column_config(),
+                "D Ps (kN)": st.column_config.NumberColumn("Dead Ps (kN)", step=100.0),
+                "D Msx (kN-m)": st.column_config.NumberColumn("Dead Msx (kN-m)", step=50.0),
+                "D Msy (kN-m)": st.column_config.NumberColumn("Dead Msy (kN-m)", step=50.0),
+                "L Ps (kN)": st.column_config.NumberColumn("Live Ps (kN)", step=100.0),
+                "L Msx (kN-m)": st.column_config.NumberColumn("Live Msx (kN-m)", step=50.0),
+                "L Msy (kN-m)": st.column_config.NumberColumn("Live Msy (kN-m)", step=50.0),
+                "D Factor": st.column_config.NumberColumn("Dead factor", step=0.1),
+                "L Factor": st.column_config.NumberColumn("Live factor", step=0.1),
+            },
+        )
+        manual_df = normalize_manual_service_load_columns(ensure_group_columns(manual_df, geom))
+        st.session_state["manual_foundations_df"] = manual_df
+        st.session_state["active_groups_df"] = manual_df
+        return {
+            "mode": "manual",
+            "groups": manual_df,
+            "sap_df": pd.DataFrame(),
+        }
 
     uploaded = st.file_uploader("Upload SAP2000 joint reaction table (CSV/XLSX)", type=["csv", "xlsx"])
     df = read_uploaded_table(uploaded)
+    if df is not None and not df.empty:
+        st.session_state["sap2000_import_df"] = df
+    elif "sap2000_import_df" in st.session_state:
+        df = st.session_state["sap2000_import_df"]
     if df is None or df.empty:
-        st.info("Upload SAP2000 reaction output. Until then, manual default load is used.")
-        return LoadCase()
+        st.info("Upload SAP2000 reaction output, or load a saved state that contains SAP2000 import data.")
+        return {
+            "mode": "sap",
+            "loadcases": [LoadCase()],
+            "groups": pd.DataFrame([group_defaults_from_geometry(geom, "Foundation 1", "")]),
+            "sap_df": pd.DataFrame(),
+        }
 
-    st.write("Preview")
+    st.write("Normalized SAP2000 Joint Reactions preview")
     st.dataframe(df.head(30), use_container_width=True)
 
     cmap = sap2000_column_map(df)
@@ -1963,7 +2875,7 @@ def load_input_ui() -> LoadCase:
 
     env = sap_envelope_table(df, cmap)
     if not env.empty:
-        st.write("Quick envelope by case")
+        st.write("Quick envelope by OutputCase")
         st.dataframe(env, use_container_width=True)
 
     columns = list(df.columns)
@@ -1983,17 +2895,58 @@ def load_input_ui() -> LoadCase:
         vy_col = st.selectbox("Vy column", ["- none -"] + columns, index=0)
         torsion_col = st.selectbox("Torsion column", ["- none -"] + columns, index=0)
 
-    selected_index = st.number_input("Use table row index for design", min_value=0, max_value=max(len(df) - 1, 0), value=0, step=1)
-    row = df.iloc[int(selected_index)]
+    case_type_col = cmap.get("case_type")
+    if case_type_col and case_type_col in df.columns:
+        case_types = sorted([str(v) for v in df[case_type_col].dropna().unique().tolist()])
+        selected_case_types = st.multiselect("CaseType filter", case_types, default=[v for v in case_types if v.lower() == "combination"] or case_types)
+        if selected_case_types:
+            df = df[df[case_type_col].astype(str).isin(selected_case_types)].copy()
 
-    case_name = "SAP2000"
-    case_col = cmap.get("case")
-    if case_col and case_col in df.columns:
-        case_name += f" - {row.get(case_col)}"
+    st.markdown("#### Joint groups")
+    st.caption("Create foundation-type groups and list SAP2000 joint numbers. Each selected Joint + OutputCase is designed separately, then the group is enveloped.")
+    if "sap_groups_df" not in st.session_state or st.session_state["sap_groups_df"].empty:
+        saved_groups = (st.session_state.get("saved_state_payload") or {}).get("groups", pd.DataFrame())
+        st.session_state["sap_groups_df"] = ensure_group_columns(saved_groups, geom) if isinstance(saved_groups, pd.DataFrame) and not saved_groups.empty else default_sap_groups(df, cmap, geom)
 
-    lc = build_loadcase_from_sap_row(
-        row=row,
-        cmap=cmap,
+    joint_col = cmap.get("joint")
+    available_joints = []
+    if joint_col and joint_col in df.columns:
+        available_joints = sorted({str(v).strip() for v in df[joint_col].dropna().tolist() if str(v).strip()})
+    if available_joints:
+        with st.expander("Add / update group by picking joints", expanded=True):
+            gc1, gc2 = st.columns([0.35, 0.65])
+            with gc1:
+                picked_group_name = st.text_input("Group name", value="Group 1")
+            with gc2:
+                picked_joints = st.multiselect("Joint numbers", available_joints)
+            if st.button("Add / update group", use_container_width=False):
+                groups_work = st.session_state["sap_groups_df"].copy()
+                new_row = group_defaults_from_geometry(geom, picked_group_name.strip() or "Unnamed Group", ", ".join(picked_joints))
+                if "Group Name" in groups_work.columns and new_row["Group Name"] in groups_work["Group Name"].astype(str).tolist():
+                    groups_work.loc[groups_work["Group Name"].astype(str) == new_row["Group Name"], "Joint IDs"] = new_row["Joint IDs"]
+                else:
+                    groups_work = pd.concat([groups_work, pd.DataFrame([new_row])], ignore_index=True)
+                st.session_state["sap_groups_df"] = groups_work
+
+    if st.button("APPLY geometry to table", key="apply_sap_sidebar_geometry", use_container_width=True):
+        st.session_state["sap_groups_df"] = apply_sidebar_geometry_to_groups(st.session_state["sap_groups_df"], geom)
+        st.success("Sidebar pile/cap geometry applied to all foundation rows.")
+    for note in group_geometry_override_warnings(st.session_state["sap_groups_df"], geom):
+        st.warning(note)
+
+    groups = st.data_editor(
+        ensure_group_columns(st.session_state["sap_groups_df"], geom),
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config=foundation_group_column_config(),
+    )
+    groups = ensure_group_columns(groups, geom)
+    st.session_state["sap_groups_df"] = groups
+    st.session_state["active_groups_df"] = groups
+
+    all_loadcases = sap_loadcases_from_rows(
+        df,
+        cmap,
         vertical_col=vertical_col,
         mx_col=mx_col,
         my_col=my_col,
@@ -2002,13 +2955,24 @@ def load_input_ui() -> LoadCase:
         torsion_col=None if torsion_col == "- none -" else torsion_col,
         vertical_sign=float(vertical_sign),
         moment_sign=float(moment_sign),
-        name=case_name,
     )
-
-    st.success(
-        f"Selected load: Pu={lc.Pu_kN:.2f} kN, Mux={lc.Mux_kNm:.2f} kN-m, Muy={lc.Muy_kNm:.2f} kN-m"
-    )
-    return lc
+    st.success(f"Ready to design {len(groups)} group(s). SAP rows will be enveloped by Joint + OutputCase, not summed across joints.")
+    st.info("Design phases: pile/geotechnical checks use service combinations named CS-xx; concrete, bending, shear, and reinforcement use ultimate combinations named CU-xx.")
+    return {
+        "mode": "sap",
+        "loadcases": all_loadcases or [LoadCase()],
+        "groups": groups,
+        "sap_df": df,
+        "cmap": cmap,
+        "vertical_col": vertical_col,
+        "mx_col": mx_col,
+        "my_col": my_col,
+        "vx_col": None if vx_col == "- none -" else vx_col,
+        "vy_col": None if vy_col == "- none -" else vy_col,
+        "torsion_col": None if torsion_col == "- none -" else torsion_col,
+        "vertical_sign": float(vertical_sign),
+        "moment_sign": float(moment_sign),
+    }
 
 
 def pile_layout_ui(geom: Geometry) -> List[PilePoint]:
@@ -2072,10 +3036,11 @@ def render_metric_row(state: DesignState, results: Dict[str, Any]):
     checks = results["checks"]
     max_ratio = max([c.ratio for c in checks if np.isfinite(c.ratio)] + [0.0])
     fails = sum(1 for c in checks if c.status == "FAIL")
-    near = sum(1 for c in checks if c.status == "NEAR")
+    near = sum(1 for c in checks if c.status in {"NEAR", "STM"})
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Overall max D/C", f"{max_ratio:.2f}", "FAIL" if fails else ("NEAR" if near else "PASS"))
+    status = "FAIL" if fails or max_ratio > 1.0 else ("NEAR" if near else "PASS")
+    c1.metric("Overall max D/C", f"{max_ratio:.2f}", status, delta_color="off")
     c2.metric("Cap size X × Y", f"{state.cap_length_x_mm:.0f} × {state.cap_width_y_mm:.0f} mm")
     c3.metric("Thickness h", f"{state.geometry.cap_thickness_mm:.0f} mm")
     c4.metric("Pu used", f"{results['Pu_total_kN']:.0f} kN")
@@ -2093,21 +3058,49 @@ def format_display_dataframe(df: pd.DataFrame, formats: Dict[str, str]) -> pd.Da
     return display
 
 
-def render_check_cards(checks: List[CheckResult]):
-    df = checks_to_dataframe(checks)
-    def color_status(val):
-        if val == "PASS":
-            return "background-color: rgba(60,180,90,0.16)"
-        if val == "NEAR":
-            return "background-color: rgba(255,190,0,0.18)"
-        if val == "FAIL":
-            return "background-color: rgba(255,70,70,0.18)"
+def style_dc_table(df: pd.DataFrame):
+    def style_row(row):
+        ratio = safe_float(row.get("Ratio", 0.0), 0.0)
+        status = str(row.get("Status", ""))
+        color = ""
+        if ratio > 1.0 or status == "FAIL":
+            color = "background-color: rgba(255, 70, 70, 0.22)"
+        elif status in {"NEAR", "STM"}:
+            color = "background-color: rgba(255, 190, 0, 0.18)"
+        elif status == "PASS":
+            color = "background-color: rgba(60, 180, 90, 0.12)"
+        return [color] * len(row)
+    return df.style.apply(style_row, axis=1)
+
+
+def style_dc_columns(df: pd.DataFrame):
+    dc_cols = [c for c in df.columns if "D/C" in str(c) or "ratio" in str(c).lower()]
+
+    def color_value(value):
+        v = safe_float(value, np.nan)
+        if np.isfinite(v) and v > 1.0:
+            return "background-color: rgba(255, 70, 70, 0.24)"
         return ""
 
+    styler = df.style
+    if not dc_cols:
+        return styler
+    if hasattr(styler, "map"):
+        return styler.map(color_value, subset=dc_cols)
+    return styler.applymap(color_value, subset=dc_cols)
+
+
+def render_check_cards(checks: List[CheckResult]):
+    df = checks_to_dataframe(checks)
     display_df = format_display_dataframe(df, {"Demand": "{:,.2f}", "Capacity": "{:,.2f}", "Ratio": "{:.3f}"})
+    info_mask = df["Ratio"].map(lambda v: isinstance(v, (int, float, np.floating)) and not np.isfinite(v))
+    if "Capacity" in display_df.columns:
+        display_df.loc[info_mask, "Capacity"] = "-"
+    if "Ratio" in display_df.columns:
+        display_df.loc[info_mask, "Ratio"] = "-"
 
     st.dataframe(
-        display_df,
+        style_dc_table(display_df),
         use_container_width=True,
         hide_index=True,
     )
@@ -2119,10 +3112,11 @@ def render_design_summary(state: DesignState, results: Dict[str, Any]):
     c1, c2 = st.columns(2)
 
     with c1:
-        st.markdown("#### Main bottom reinforcement")
+        st.markdown("#### Flexural reinforcement")
         summary = pd.DataFrame(
             [
                 {
+                    "Layer": "Bottom",
                     "Direction": "X bars",
                     "Bar": state.reinforcement.main_bar_x,
                     "Required As (mm²)": results["flex_x"]["As_req_mm2"],
@@ -2132,9 +3126,11 @@ def render_design_summary(state: DesignState, results: Dict[str, Any]):
                     "Bars count": results["spacing_x"]["n_bars"],
                     "Provided As (mm²)": results["spacing_x"]["As_prov_mm2"],
                     "φMn (kN-m)": results["cap_xbars"]["phiMn_kNm"],
+                    "D/C": results["moment_demands"]["M_for_X_bars_kNm"] / max(results["cap_xbars"]["phiMn_kNm"], 1e-9),
                 },
                 {
                     "Direction": "Y bars",
+                    "Layer": "Bottom",
                     "Bar": state.reinforcement.main_bar_y,
                     "Required As (mm²)": results["flex_y"]["As_req_mm2"],
                     "Strength As (mm²)": results["flex_y"]["As_strength_mm2"],
@@ -2143,20 +3139,50 @@ def render_design_summary(state: DesignState, results: Dict[str, Any]):
                     "Bars count": results["spacing_y"]["n_bars"],
                     "Provided As (mm²)": results["spacing_y"]["As_prov_mm2"],
                     "φMn (kN-m)": results["cap_ybars"]["phiMn_kNm"],
+                    "D/C": results["moment_demands"]["M_for_Y_bars_kNm"] / max(results["cap_ybars"]["phiMn_kNm"], 1e-9),
+                },
+                {
+                    "Layer": "Top",
+                    "Direction": "X bars",
+                    "Bar": state.reinforcement.top_bar,
+                    "Required As (mm²)": results["top_flex_x"]["As_req_mm2"],
+                    "Strength As (mm²)": results["top_flex_x"]["As_strength_mm2"],
+                    "Minimum As (mm²)": results["top_flex_x"]["As_min_mm2"],
+                    "Use spacing (mm)": results["top_spacing_x"]["spacing_use_mm"],
+                    "Bars count": results["top_spacing_x"]["n_bars"],
+                    "Provided As (mm²)": results["top_spacing_x"]["As_prov_mm2"],
+                    "φMn (kN-m)": results["top_cap_xbars"]["phiMn_kNm"],
+                    "D/C": results["moment_demands"]["M_for_X_bars_kNm"] / max(results["top_cap_xbars"]["phiMn_kNm"], 1e-9),
+                },
+                {
+                    "Layer": "Top",
+                    "Direction": "Y bars",
+                    "Bar": state.reinforcement.top_bar,
+                    "Required As (mm²)": results["top_flex_y"]["As_req_mm2"],
+                    "Strength As (mm²)": results["top_flex_y"]["As_strength_mm2"],
+                    "Minimum As (mm²)": results["top_flex_y"]["As_min_mm2"],
+                    "Use spacing (mm)": results["top_spacing_y"]["spacing_use_mm"],
+                    "Bars count": results["top_spacing_y"]["n_bars"],
+                    "Provided As (mm²)": results["top_spacing_y"]["As_prov_mm2"],
+                    "φMn (kN-m)": results["top_cap_ybars"]["phiMn_kNm"],
+                    "D/C": results["moment_demands"]["M_for_Y_bars_kNm"] / max(results["top_cap_ybars"]["phiMn_kNm"], 1e-9),
                 },
             ]
         )
         st.dataframe(
-            format_display_dataframe(
-                summary,
-                {
-                    "Required As (mm²)": "{:,.0f}",
-                    "Strength As (mm²)": "{:,.0f}",
-                    "Minimum As (mm²)": "{:,.0f}",
-                    "Use spacing (mm)": "{:,.0f}",
-                    "Provided As (mm²)": "{:,.0f}",
-                    "φMn (kN-m)": "{:,.1f}",
-                },
+            style_dc_columns(
+                format_display_dataframe(
+                    summary,
+                    {
+                        "Required As (mm²)": "{:,.0f}",
+                        "Strength As (mm²)": "{:,.0f}",
+                        "Minimum As (mm²)": "{:,.0f}",
+                        "Use spacing (mm)": "{:,.0f}",
+                        "Provided As (mm²)": "{:,.0f}",
+                        "φMn (kN-m)": "{:,.1f}",
+                        "D/C": "{:.3f}",
+                    },
+                )
             ),
             use_container_width=True,
             hide_index=True,
@@ -2164,16 +3190,32 @@ def render_design_summary(state: DesignState, results: Dict[str, Any]):
 
     with c2:
         st.markdown("#### Shear and detailing")
+        mto = calculate_material_takeoff(state, results)
         detail = pd.DataFrame(
             [
+                {"Item": "Concrete Volume", "Value": mto["concrete_vol_m3"], "Unit": "m³"},
+                {"Item": "Main Rebar Weight", "Value": mto["main_rebar_kg"], "Unit": "kg"},
+                {"Item": "Rebar Ratio", "Value": mto["rebar_ratio_kg_m3"], "Unit": "kg/m³"},
                 {"Item": "Effective depth X bars", "Value": results["d_x_mm"], "Unit": "mm"},
                 {"Item": "Effective depth Y bars", "Value": results["d_y_mm"], "Unit": "mm"},
+                {"Item": "Effective depth top X bars", "Value": results["d_top_x_mm"], "Unit": "mm"},
+                {"Item": "Effective depth top Y bars", "Value": results["d_top_y_mm"], "Unit": "mm"},
                 {"Item": "One-way φVc, section normal to Y", "Value": results["one_way_x"]["phiVc_kN"], "Unit": "kN"},
                 {"Item": "One-way φVc, section normal to X", "Value": results["one_way_y"]["phiVc_kN"], "Unit": "kN"},
+                {"Item": "One-way lambda_s, section normal to Y", "Value": results["one_way_x"]["lambda_s"],
+                 "Unit": ""},
+                {"Item": "One-way rho_w, section normal to Y", "Value": results["one_way_x"]["rho_w"], "Unit": ""},
+                {"Item": "One-way lambda_s, section normal to X", "Value": results["one_way_y"]["lambda_s"],
+                 "Unit": ""},
+                {"Item": "One-way rho_w, section normal to X", "Value": results["one_way_y"]["rho_w"], "Unit": ""},
                 {"Item": "Punching bo", "Value": results["punch_demand"]["bo_mm"], "Unit": "mm"},
                 {"Item": "Punching φVc", "Value": results["punch_cap"]["phiVc_kN"], "Unit": "kN"},
+                {"Item": "Punching lambda_s", "Value": results["punch_cap"]["lambda_s"], "Unit": ""},
+                {"Item": "Punching beta", "Value": results["punch_cap"]["beta"], "Unit": ""},
+                {"Item": "Punching alpha_s", "Value": results["punch_cap"]["alpha_s"], "Unit": ""},
                 {"Item": "Development estimate X bars", "Value": results["ld_x_mm"], "Unit": "mm"},
                 {"Item": "Development estimate Y bars", "Value": results["ld_y_mm"], "Unit": "mm"},
+                {"Item": "Development estimate top bars", "Value": results["ld_top_mm"], "Unit": "mm"},
                 {"Item": "STM tie As advisory X bars", "Value": results["As_stm_x_mm2"], "Unit": "mm²"},
                 {"Item": "STM tie As advisory Y bars", "Value": results["As_stm_y_mm2"], "Unit": "mm²"},
             ]
@@ -2184,6 +3226,8 @@ def render_design_summary(state: DesignState, results: Dict[str, Any]):
 def render_engineering_notes(results: Dict[str, Any]):
     notes = []
     stm = results["stm"]
+    if any(c.status == "STM" for c in results.get("checks", [])):
+        notes.append("One or more sectional shear checks are not meaningful because the critical section encloses the pile reactions. Treat the pile cap as a deep member and verify STM struts, ties, nodal zones, and anchorage.")
     if not stm.empty and (stm["theta (deg)"] < 25.0).any():
         notes.append("Some STM strut angles are below about 25°. A deeper cap or revised pile spacing may be required.")
     if not stm.empty and (stm["theta (deg)"] > 65.0).any():
@@ -2208,18 +3252,23 @@ def render_code_basis():
         professional preliminary pile-cap sizing:
 
         1. Rigid pile-cap vertical load distribution to piles from axial load and biaxial moment.
-        2. Pile compression/uplift capacity check from the geotechnical design values entered by the user.
-        3. Simplified flexural design at the face of the column/pedestal using pile reactions outside the section.
+        2. Pile compression/uplift capacity checks use service load combinations named CS-xx, or manual service D+L.
+        3. Concrete footing, bending, one-way shear, punching shear, bearing, and reinforcement use ultimate load combinations named CU-xx, or manual factored D/L.
         4. One-way shear at a distance d from the loaded area.
         5. Two-way punching shear at a perimeter d/2 from the loaded area.
-        6. Practical strut-and-tie advisory based on the load path from column/pedestal to pile heads.
-        7. Drawing-style output for plan and elevation review.
+        6. Bottom and top flexural bars are checked from the M1/M2 pile-cap bending demand using the user-entered bar sizes and spacings.
+        7. Practical strut-and-tie advisory based on the load path from column/pedestal to pile heads.
+        8. Drawing-style output for plan and elevation review.
 
         Critical assumptions to verify:
         - Compression-positive sign convention.
         - Exact SAP2000 reaction direction/signs.
         - Pile-cap behavior: sectional method may be inappropriate for very deep caps; use STM.
         - ACI 318-25 modifiers for shear, punching, development, seismic detailing, and anchorage.
+        - Punching demand includes cap self-weight with Pu as a conservative preliminary assumption; strictly, only the column load creates punching at the loaded-area perimeter.
+        - One-way shear capacity uses the full rectangular cap width at the checked section; verify non-rectangular or highly irregular caps separately.
+        - STM tie steel shown here is advisory; balanced components are halved to avoid double-counting symmetric opposite-side load paths, but a formal project STM may govern.
+        - Top flexure check neglects uplift, lateral force, torsion, and pile-head fixity moment.
         - Pile head fixity, pile tolerance, eccentricity, lateral load, settlement, and group effects.
         """
     )
@@ -2228,19 +3277,27 @@ def render_code_basis():
             """
 Pile reaction:
     R_i = P/n + Mx*y_i/sum(y^2) + My*x_i/sum(x^2)
+    Pile design uses service load cases CS-xx or manual D+L.
 
 Flexure:
     phi * As * fy * (d - a/2) >= Mu
     a = As*fy/(0.85*fc'*b)
+    RC footing design uses ultimate load cases CU-xx or manual factored D/L.
 
 Minimum flexural steel:
     As,min = max(0.25*sqrt(fc')/fy, 1.4/fy) * b*d
 
 One-way shear:
-    phi Vc = phi * 0.17 * lambda * sqrt(fc') * b * d
+    lambda_s = sqrt(2 / (1 + 0.004d)) <= 1
+    phi Vc = phi * [0.66*lambda_s*lambda*rho_w^(1/3)*sqrt(fc') + Nu/(6Ag)] * b*d
+    vc is capped by 0.42*lambda*sqrt(fc')
 
-Two-way punching, simplified interior:
-    phi Vc = phi * 0.33 * lambda * sqrt(fc') * bo * d
+Two-way punching:
+    phi Vc = phi * min(vc_a, vc_b, vc_c) * bo*d
+    vc_a = 0.33*lambda_s*lambda*sqrt(fc')
+    vc_b = (0.17 + 0.33/beta)*lambda_s*lambda*sqrt(fc')
+    vc_c = (0.17 + 0.083*alpha_s*d/bo)*lambda_s*lambda*sqrt(fc')
+    pile reaction reduction is linearly interpolated near the critical perimeter
 
 STM advisory:
     theta = atan(d/a)
@@ -2259,6 +3316,7 @@ def main():
     render_header()
 
     mat, geom, reinf, include_self_weight = sidebar_inputs()
+    current_signature = None
 
     tab_input, tab_results, tab_drawing, tab_stm, tab_report, tab_basis = st.tabs(
         ["1 Input", "2 Design Results", "3 Drawing Output", "4 STM Advisory", "5 Report / Export", "6 Basis"]
@@ -2267,118 +3325,154 @@ def main():
     with tab_input:
         left, right = st.columns([1.05, 0.95], gap="large")
         with left:
-            loadcase = load_input_ui()
+            load_input = load_input_ui(geom)
         with right:
+            st.caption("Default pile layout preview. Each foundation row can override pile count, spacing, thickness, and pile capacities.")
             piles_base = pile_layout_ui(geom)
+            st.caption("Group-level spacing and edge warnings are reported in the batch summary after DESIGN.")
 
         cap_x, cap_y = cap_dimensions_from_piles(piles_base, geom.edge_from_pile_edge_mm)
         sw = self_weight_cap_kN(cap_x, cap_y, geom.cap_thickness_mm, mat.gamma_conc_kN_m3)
-
-        piles_with_reactions = distribute_vertical_load_to_piles(
-            piles_base,
-            loadcase.Pu_kN,
-            loadcase.Mux_kNm,
-            loadcase.Muy_kNm,
-            include_self_weight_kN=sw if include_self_weight else 0.0,
-        )
-
-        # Update state dataframe reaction display
-        reaction_df = piles_to_dataframe(piles_with_reactions)
-        st.session_state["pile_layout_df"]["reaction_kN"] = reaction_df["reaction_kN"].values
-
-        state = DesignState(
-            material=mat,
-            geometry=geom,
-            reinforcement=reinf,
-            loadcase=loadcase,
-            piles=piles_with_reactions,
-            cap_length_x_mm=cap_x,
-            cap_width_y_mm=cap_y,
-            effective_depth_x_mm=effective_depths(geom, reinf)[0],
-            effective_depth_y_mm=effective_depths(geom, reinf)[1],
-            self_weight_kN=sw if include_self_weight else 0.0,
-        )
-
-        results = design_all(state, use_self_weight=include_self_weight)
-        st.session_state["last_state_json"] = json.dumps(asdict(state), default=str)
-        st.session_state["last_report"] = make_markdown_report(state, results)
+        current_signature = design_input_signature(mat, geom, reinf, include_self_weight, load_input)
 
         st.markdown("---")
-        render_metric_row(state, results)
-
-        c1, c2 = st.columns(2)
+        c1, c2 = st.columns([0.35, 0.65])
         with c1:
-            st.markdown("#### Pile reactions")
+            design_clicked = st.button("DESIGN", type="primary", use_container_width=True)
+        with c2:
+            st.caption("DESIGN runs every real load row in each group, envelopes pile reactions per pile, and uses governing combinations for reinforcement/checks.")
+
+        if design_clicked:
+            groups_df = load_input.get("groups", pd.DataFrame())
+            batch_items = []
+            summary_rows = []
+            pile_env_frames = []
+            sap_df = load_input.get("sap_df", pd.DataFrame())
+            cmap = load_input.get("cmap", {})
+            joint_col = cmap.get("joint") if isinstance(cmap, dict) else None
+
+            if load_input.get("mode") == "sap" and isinstance(groups_df, pd.DataFrame) and not groups_df.empty:
+                for _, group_row in groups_df.iterrows():
+                    group_name = str(group_row.get("Group Name", "") or "Unnamed Group").strip()
+                    group_geom = geometry_from_group_row(geom, group_row)
+                    group_piles = piles_from_group_geometry(group_geom)
+                    joints = parse_joint_list(group_row.get("Joint IDs", ""))
+                    group_df = sap_df
+                    if joint_col and joint_col in sap_df.columns and joints:
+                        group_df = sap_df[sap_df[joint_col].astype(str).isin(joints)].copy()
+                    loadcases = sap_loadcases_from_rows(
+                        group_df,
+                        cmap,
+                        load_input["vertical_col"],
+                        load_input["mx_col"],
+                        load_input["my_col"],
+                        load_input["vx_col"],
+                        load_input["vy_col"],
+                        load_input["torsion_col"],
+                        load_input["vertical_sign"],
+                        load_input["moment_sign"],
+                        group_name=group_name,
+                    )
+                    service_cases = [lc for lc in loadcases if is_service_loadcase(lc)]
+                    ultimate_cases = [lc for lc in loadcases if is_ultimate_loadcase(lc)]
+                    item = envelope_group_design(
+                        group_name,
+                        loadcases,
+                        mat,
+                        group_geom,
+                        reinf,
+                        group_piles,
+                        include_self_weight,
+                        service_loadcases=service_cases,
+                        ultimate_loadcases=ultimate_cases,
+                    )
+                    batch_items.append(item)
+                    summary_rows.append(item["summary"])
+                    pile_env_frames.append(item["pile_envelope"])
+            else:
+                for _, group_row in groups_df.iterrows():
+                    group_name = str(group_row.get("Group Name", "") or "Manual Foundation").strip()
+                    group_geom = geometry_from_group_row(geom, group_row)
+                    group_piles = piles_from_group_geometry(group_geom)
+                    service_lc, ultimate_lc = manual_service_ultimate_loadcases(group_row, group_name)
+                    item = envelope_group_design(
+                        group_name,
+                        [service_lc, ultimate_lc],
+                        mat,
+                        group_geom,
+                        reinf,
+                        group_piles,
+                        include_self_weight,
+                        service_loadcases=[service_lc],
+                        ultimate_loadcases=[ultimate_lc],
+                    )
+                    batch_items.append(item)
+                    summary_rows.append(item["summary"])
+                    pile_env_frames.append(item["pile_envelope"])
+
+            summary_df = pd.DataFrame(summary_rows)
+            pile_env_df = pd.concat(pile_env_frames, ignore_index=True) if pile_env_frames else pd.DataFrame()
+            st.session_state["batch_design"] = {"items": batch_items, "summary": summary_df, "pile_envelopes": pile_env_df}
+            st.session_state["design_input_signature"] = current_signature
+            st.session_state["selected_design_group"] = batch_items[0]["group"] if batch_items else ""
+            st.success(f"Design complete for {len(batch_items)} group(s).")
+
+        batch = st.session_state.get("batch_design")
+        if isinstance(batch, dict) and not batch.get("summary", pd.DataFrame()).empty:
+            st.markdown("#### Latest design run")
+            st.dataframe(style_dc_columns(batch["summary"]), use_container_width=True, hide_index=True)
+            if not batch.get("pile_envelopes", pd.DataFrame()).empty:
+                st.markdown("#### Pile reaction envelopes")
+                st.dataframe(style_dc_columns(batch["pile_envelopes"]), use_container_width=True, hide_index=True)
+        else:
+            st.info("Prepare inputs and click DESIGN to generate results.")
+
+    batch = st.session_state.get("batch_design")
+    if not isinstance(batch, dict) or not batch.get("items"):
+        with tab_results:
+            st.info("No design results yet. Go to Input and click DESIGN.")
+        with tab_drawing:
+            st.info("No drawing yet. Go to Input and click DESIGN.")
+        with tab_stm:
+            st.info("No STM results yet. Go to Input and click DESIGN.")
+        with tab_report:
+            st.info("No export yet. Go to Input and click DESIGN.")
+        with tab_basis:
+            render_code_basis()
+        st.stop()
+
+    groups_available = [item["group"] for item in batch["items"]]
+    selected_group = st.sidebar.selectbox(
+        "Results group",
+        groups_available,
+        index=groups_available.index(st.session_state.get("selected_design_group", groups_available[0])) if st.session_state.get("selected_design_group") in groups_available else 0,
+    )
+    st.session_state["selected_design_group"] = selected_group
+    selected_item = next(item for item in batch["items"] if item["group"] == selected_group)
+    state = selected_item["state"]
+    results = selected_item["results"]
+    results_are_stale = current_signature is not None and st.session_state.get("design_input_signature") != current_signature
+    st.session_state["last_state_runtime"] = state
+    st.session_state["last_results_runtime"] = results
+    st.session_state["last_state_json"] = json.dumps(asdict(state), default=str)
+    st.session_state["last_report"] = make_markdown_report(state, results)
+
+    with tab_results:
+        if results_are_stale:
+            st.warning("Inputs have changed since the last DESIGN run. Click DESIGN again before using these results.")
+        if isinstance(batch.get("summary"), pd.DataFrame) and len(batch["summary"]) > 1:
+            st.markdown("### Group Design Summary")
+            st.dataframe(style_dc_columns(batch["summary"]), use_container_width=True, hide_index=True)
+        render_metric_row(state, results)
+        if results.get("governing_combos"):
+            st.markdown("### Governing Combinations")
             st.dataframe(
-                format_display_dataframe(
-                    pile_group_result_table(state.piles, geom),
-                    {
-                        "x (mm)": "{:,.0f}",
-                        "y (mm)": "{:,.0f}",
-                        "R, compression + (kN)": "{:,.1f}",
-                        "Compression ratio": "{:.3f}",
-                        "Tension ratio": "{:.3f}",
-                    },
+                pd.DataFrame(
+                    [{"Design item": key, "Governing OutputCase": value} for key, value in results["governing_combos"].items()]
                 ),
                 use_container_width=True,
                 hide_index=True,
             )
-        with c2:
-            st.markdown("#### Generated cap dimensions")
-            dim_df = pd.DataFrame(
-                [
-                    {"Item": "Cap length X", "Value": cap_x, "Unit": "mm"},
-                    {"Item": "Cap width Y", "Value": cap_y, "Unit": "mm"},
-                    {"Item": "Cap thickness", "Value": geom.cap_thickness_mm, "Unit": "mm"},
-                    {"Item": "Self weight", "Value": state.self_weight_kN, "Unit": "kN"},
-                    {"Item": "Effective depth X bars", "Value": state.effective_depth_x_mm, "Unit": "mm"},
-                    {"Item": "Effective depth Y bars", "Value": state.effective_depth_y_mm, "Unit": "mm"},
-                ]
-            )
-            st.dataframe(format_display_dataframe(dim_df, {"Value": "{:,.1f}"}), use_container_width=True, hide_index=True)
-
-    # Use latest state/results even when user opens other tabs first.
-    if "last_state_runtime" not in st.session_state:
-        try:
-            piles_base = make_piles(geom.n_piles, geom.spacing_x_mm, geom.spacing_y_mm, geom.pile_diameter_mm)
-            cap_x, cap_y = cap_dimensions_from_piles(piles_base, geom.edge_from_pile_edge_mm)
-            sw = self_weight_cap_kN(cap_x, cap_y, geom.cap_thickness_mm, mat.gamma_conc_kN_m3)
-            loadcase = LoadCase()
-            piles_with_reactions = distribute_vertical_load_to_piles(
-                piles_base, loadcase.Pu_kN, loadcase.Mux_kNm, loadcase.Muy_kNm, sw if include_self_weight else 0.0
-            )
-            state = DesignState(
-                material=mat,
-                geometry=geom,
-                reinforcement=reinf,
-                loadcase=loadcase,
-                piles=piles_with_reactions,
-                cap_length_x_mm=cap_x,
-                cap_width_y_mm=cap_y,
-                effective_depth_x_mm=effective_depths(geom, reinf)[0],
-                effective_depth_y_mm=effective_depths(geom, reinf)[1],
-                self_weight_kN=sw if include_self_weight else 0.0,
-            )
-            results = design_all(state, use_self_weight=include_self_weight)
-        except Exception:
-            state = None
-            results = None
-
-    # Because Streamlit reruns top-to-bottom, state/results from tab_input are available after the tab block.
-    try:
-        st.session_state["last_state_runtime"] = state
-        st.session_state["last_results_runtime"] = results
-    except Exception:
-        pass
-
-    state = st.session_state.get("last_state_runtime", None)
-    results = st.session_state.get("last_results_runtime", None)
-
-    if state is None or results is None:
-        st.stop()
-
-    with tab_results:
-        render_metric_row(state, results)
         st.markdown("### Strength / service check table")
         render_check_cards(results["checks"])
         render_design_summary(state, results)
@@ -2402,15 +3496,15 @@ def main():
         show_reactions = st.toggle("Show pile reactions on plan", value=True)
 
         fig_plan = plot_plan(state, results, show_rebar=show_rebar, show_reactions=show_reactions)
-        st.pyplot(fig_plan, use_container_width=True)
+        st.pyplot(fig_plan, use_container_width=True, clear_figure=True)
 
         c1, c2 = st.columns(2)
         with c1:
             fig_ex = plot_elevation(state, results, direction="X")
-            st.pyplot(fig_ex, use_container_width=True)
+            st.pyplot(fig_ex, use_container_width=True, clear_figure=True)
         with c2:
             fig_ey = plot_elevation(state, results, direction="Y")
-            st.pyplot(fig_ey, use_container_width=True)
+            st.pyplot(fig_ey, use_container_width=True, clear_figure=True)
 
         png_plan = fig_to_png_bytes(fig_plan)
         st.download_button("Download plan PNG", png_plan, "pile_cap_plan.png", "image/png")
@@ -2486,6 +3580,10 @@ def main():
                 {"Item": "X bars spacing use", "Value": results["spacing_x"]["spacing_use_mm"], "Unit": "mm"},
                 {"Item": "Y bars As required", "Value": results["flex_y"]["As_req_mm2"], "Unit": "mm²"},
                 {"Item": "Y bars spacing use", "Value": results["spacing_y"]["spacing_use_mm"], "Unit": "mm"},
+                {"Item": "Top X bars As required", "Value": results["top_flex_x"]["As_req_mm2"], "Unit": "mm²"},
+                {"Item": "Top X bars spacing use", "Value": results["top_spacing_x"]["spacing_use_mm"], "Unit": "mm"},
+                {"Item": "Top Y bars As required", "Value": results["top_flex_y"]["As_req_mm2"], "Unit": "mm²"},
+                {"Item": "Top Y bars spacing use", "Value": results["top_spacing_y"]["spacing_use_mm"], "Unit": "mm"},
                 {"Item": "Punching demand", "Value": results["punch_demand"]["Vu_punch_kN"], "Unit": "kN"},
                 {"Item": "Punching capacity", "Value": results["punch_cap"]["phiVc_kN"], "Unit": "kN"},
             ]
@@ -2515,6 +3613,15 @@ def main():
                 st.download_button("Download calculation PDF", pdf_report, "pile_foundation_calculation.pdf", "application/pdf")
             else:
                 st.warning(pdf_error)
+
+        batch = st.session_state.get("batch_design")
+        if isinstance(batch, dict):
+            st.markdown("#### Batch design exports")
+            b1, b2 = st.columns(2)
+            with b1:
+                dataframe_download_button(batch.get("summary", pd.DataFrame()), "Download group summary CSV", "pile_cap_group_summary.csv")
+            with b2:
+                dataframe_download_button(batch.get("pile_envelopes", pd.DataFrame()), "Download pile envelopes CSV", "pile_reaction_envelopes.csv")
 
         with st.expander("Preview Markdown report", expanded=False):
             st.markdown(report_md)
