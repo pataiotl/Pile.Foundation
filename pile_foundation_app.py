@@ -825,6 +825,7 @@ def one_way_shear_capacity(
     rho_w: float = 0.0025,
     Nu_kN: float = 0.0,
     Ag_mm2: Optional[float] = None,
+    use_close_pile_aci318_25: bool = False,
 ) -> Dict[str, float]:
     """
     ACI-style one-way concrete shear for members without shear reinforcement:
@@ -835,25 +836,37 @@ def one_way_shear_capacity(
 
     SI units: fc in MPa, b and d in mm. The lambda_s expression uses d in mm.
     """
-    lambda_s = min(1.0, math.sqrt(2.0 / (1.0 + 0.004 * max(d_mm, 0.0))))
+    lambda_s_general = min(1.0, math.sqrt(2.0 / (1.0 + 0.004 * max(d_mm, 0.0))))
+    lambda_s = 1.0 if use_close_pile_aci318_25 else lambda_s_general
     rho_use = min(max(rho_w, 0.0001), 0.08)
     axial_stress = 0.0
     if Ag_mm2 and Ag_mm2 > 0:
         axial_stress = kN_to_N(Nu_kN) / (6.0 * Ag_mm2)
         axial_stress = min(axial_stress, 0.05 * fc_MPa)
-    vc_refined = 0.66 * lambda_s * lambda_c * (rho_use ** (1.0 / 3.0)) * math.sqrt(fc_MPa) + axial_stress
-    vc_limit = 0.42 * lambda_c * math.sqrt(fc_MPa)
-    vc_use = min(vc_refined, vc_limit)
+    if use_close_pile_aci318_25:
+        # SI equivalent of the restored ACI 318-14/IP expression 2 lambda sqrt(fc') bw d.
+        vc_refined = 0.17 * lambda_c * math.sqrt(fc_MPa)
+        vc_limit = vc_refined
+        vc_use = vc_refined
+        formula = "ACI 318-25 close-pile one-way shear"
+    else:
+        vc_refined = 0.66 * lambda_s * lambda_c * (rho_use ** (1.0 / 3.0)) * math.sqrt(fc_MPa) + axial_stress
+        vc_limit = 0.42 * lambda_c * math.sqrt(fc_MPa)
+        vc_use = min(vc_refined, vc_limit)
+        formula = "ACI-style general one-way shear"
     Vc_N = vc_use * b_mm * d_mm
     return {
         "Vc_kN": kN_from_N(Vc_N),
         "phiVc_kN": kN_from_N(phi * Vc_N),
         "lambda_s": lambda_s,
+        "lambda_s_general": lambda_s_general,
         "rho_w": rho_use,
         "vc_MPa": vc_use,
         "vc_refined_MPa": vc_refined,
         "vc_limit_MPa": vc_limit,
         "Nu_over_6Ag_MPa": axial_stress,
+        "use_close_pile_aci318_25": use_close_pile_aci318_25,
+        "formula": formula,
     }
 
 
@@ -866,6 +879,7 @@ def two_way_shear_capacity(
     loaded_bx_mm: float = 1.0,
     loaded_by_mm: float = 1.0,
     column_location: str = "Interior",
+    use_close_pile_aci318_25: bool = False,
 ) -> Dict[str, float]:
     """
     ACI-style two-way punching shear without shear reinforcement:
@@ -876,7 +890,8 @@ def two_way_shear_capacity(
 
     SI units: fc in MPa, bo and d in mm. The lambda_s expression uses d in mm.
     """
-    lambda_s = min(1.0, math.sqrt(2.0 / (1.0 + 0.004 * max(d_mm, 0.0))))
+    lambda_s_general = min(1.0, math.sqrt(2.0 / (1.0 + 0.004 * max(d_mm, 0.0))))
+    lambda_s = 1.0 if use_close_pile_aci318_25 else lambda_s_general
     loaded_short = max(min(loaded_bx_mm, loaded_by_mm), 1e-9)
     beta = max(max(loaded_bx_mm, loaded_by_mm) / loaded_short, 1.0)
     loc = str(column_location or "Interior").strip().lower()
@@ -893,6 +908,7 @@ def two_way_shear_capacity(
         "Vc_kN": kN_from_N(Vc_N),
         "phiVc_kN": kN_from_N(phi * Vc_N),
         "lambda_s": lambda_s,
+        "lambda_s_general": lambda_s_general,
         "beta": beta,
         "alpha_s": alpha_s,
         "vc_MPa": vc_use,
@@ -900,6 +916,7 @@ def two_way_shear_capacity(
         "vc_beta_limit_MPa": vc_b,
         "vc_alpha_s_limit_MPa": vc_c,
         "governing_equation": governing,
+        "use_close_pile_aci318_25": use_close_pile_aci318_25,
     }
 
 
@@ -1007,6 +1024,43 @@ def top_effective_depths(geom: Geometry, reinf: Reinforcement) -> Tuple[float, f
     d_top_x = geom.cap_thickness_mm - geom.top_cover_mm - db / 2.0
     d_top_y = geom.cap_thickness_mm - geom.top_cover_mm - db - db / 2.0
     return max(d_top_x, 1.0), max(d_top_y, 1.0)
+
+
+def close_pile_spacing_check(piles: List[PilePoint], geom: Geometry, limit_factor: float = 4.0) -> Dict[str, Any]:
+    if len(piles) < 2:
+        return {
+            "applies": False,
+            "limit_factor": limit_factor,
+            "limit_mm": limit_factor * geom.pile_diameter_mm,
+            "max_nearest_spacing_mm": 0.0,
+            "nearest_spacings_mm": {},
+            "note": "Close-pile shear provision needs at least two piles.",
+        }
+
+    nearest = {}
+    for p in piles:
+        distances = [
+            math.hypot(p.x_mm - other.x_mm, p.y_mm - other.y_mm)
+            for other in piles
+            if other.label != p.label
+        ]
+        nearest[p.label] = min(distances) if distances else 0.0
+
+    max_nearest = max(nearest.values()) if nearest else 0.0
+    limit = limit_factor * geom.pile_diameter_mm
+    applies = max_nearest <= limit + 1e-9
+    return {
+        "applies": applies,
+        "limit_factor": limit_factor,
+        "limit_mm": limit,
+        "max_nearest_spacing_mm": max_nearest,
+        "nearest_spacings_mm": nearest,
+        "note": (
+            f"ACI 318-25 close-pile shear provision applies: max nearest pile spacing {max_nearest:.0f} mm <= {limit_factor:.0f}D = {limit:.0f} mm."
+            if applies
+            else f"ACI 318-25 close-pile shear provision does not apply: max nearest pile spacing {max_nearest:.0f} mm > {limit_factor:.0f}D = {limit:.0f} mm."
+        ),
+    }
 
 
 def calculate_material_takeoff(state: DesignState, results: Dict[str, Any]) -> Dict[str, float]:
@@ -1436,13 +1490,16 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
     top_cap_ybars = flexural_capacity(top_sp_y["As_prov_mm2"], cap_x, d_top_y, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure)
     rho_x_provided = sp_x["As_prov_mm2"] / max(cap_y * d_x, 1e-9)
     rho_y_provided = sp_y["As_prov_mm2"] / max(cap_x * d_y, 1e-9)
+    close_pile = close_pile_spacing_check(state.piles, geom)
 
     # One-way shear capacities by section orientation.
     ow_sec_normal_to_x = one_way_shear_capacity(
-        cap_y, d_y, mat.fc_MPa, mat.lambda_c, mat.phi_shear, rho_w=rho_y_provided
+        cap_y, d_y, mat.fc_MPa, mat.lambda_c, mat.phi_shear, rho_w=rho_y_provided,
+        use_close_pile_aci318_25=close_pile["applies"],
     )
     ow_sec_normal_to_y = one_way_shear_capacity(
-        cap_x, d_x, mat.fc_MPa, mat.lambda_c, mat.phi_shear, rho_w=rho_x_provided
+        cap_x, d_x, mat.fc_MPa, mat.lambda_c, mat.phi_shear, rho_w=rho_x_provided,
+        use_close_pile_aci318_25=close_pile["applies"],
     )
 
     # Punching capacity:
@@ -1457,6 +1514,7 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
         loaded_bx_mm=loaded_bx,
         loaded_by_mm=loaded_by,
         column_location=geom.column_location,
+        use_close_pile_aci318_25=close_pile["applies"],
     )
 
     # Bearing at column/pedestal:
@@ -1695,6 +1753,7 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
         "moment_demands": moment_demands,
         "continuous_x": continuous_x,
         "continuous_y": continuous_y,
+        "close_pile_spacing": close_pile,
         "shear_demands": shear_demands,
         "punch_demand": punch_demand,
         "flex_x": flex_x,
@@ -2636,7 +2695,7 @@ def make_markdown_report(state: DesignState, results: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("## Notes")
     lines.append("- Verify ACI 318-25 clauses directly for final design.")
-    lines.append("- Shear capacities include lambda_s size effect; punching uses the least of upper-limit, beta, and alpha_s expressions.")
+    lines.append("- Shear capacities use the ACI 318-25 close-pile provision when the pile spacing check is satisfied; otherwise they include lambda_s size effect.")
     lines.append("- Pile reactions near the punching perimeter are linearly reduced over one pile radius each side of the critical section.")
     lines.append("- For pile caps with small shear span-to-depth ratio, use a full strut-and-tie model.")
     lines.append("- For seismic regions, pile anchorage, confinement, tie forces, shear friction, and ductile detailing may govern.")
@@ -2754,7 +2813,7 @@ def make_fallback_calculation_pdf(state: DesignState, results: Dict[str, Any]) -
             "Formula Notes",
             "R_i = P/n + Mx*y_i/sum(y^2) + My*x_i/sum(x^2)",
             "Flexure: phi As fy (d - a/2) >= Mu",
-            "One-way shear includes rho_w and lambda_s; punching uses beta, alpha_s, and upper-limit expressions.",
+            "One-way and punching shear use the ACI 318-25 close-pile provision when the pile spacing check is satisfied.",
             "Top flexure is checked from continuous beam-strip negative support moment where interior pile lines exist.",
             "Lateral load and torsion are flagged separately and need project-specific checks.",
         ]
@@ -2834,8 +2893,9 @@ def make_calculation_pdf(state: DesignState, results: Dict[str, Any]) -> bytes:
         pdf_safe(
             "Pile reaction: R_i = P/n + Mx*y_i/sum(y^2) + My*x_i/sum(x^2)\n"
             "Flexure: phi * As * fy * (d - a/2) >= Mu; a = As*fy/(0.85*fc'*b)\n"
-            "One-way shear: phi Vc = phi * [0.66*lambda_s*lambda*rho_w^(1/3)*sqrt(fc') + Nu/(6Ag)] * b * d, capped by vc <= 0.42*lambda*sqrt(fc')\n"
-            "Two-way punching: phi Vc = phi * min(vc_a, vc_b, vc_c) * bo * d using lambda_s, beta, and alpha_s terms\n"
+            "One-way shear: general branch uses phi Vc = phi * [0.66*lambda_s*lambda*rho_w^(1/3)*sqrt(fc') + Nu/(6Ag)] * b * d, capped by vc <= 0.42*lambda*sqrt(fc')\n"
+            "ACI 318-25 close-pile branch: pile caps with spacing <= 4D use vc = 0.17*lambda*sqrt(fc') in SI units for one-way shear\n"
+            "Two-way punching: phi Vc = phi * min(vc_a, vc_b, vc_c) * bo * d using lambda_s, beta, and alpha_s terms; close-pile branch takes lambda_s = 1.0\n"
             "Punching demand: pile reactions near the critical perimeter are linearly proportioned over +/- pile radius\n"
             "STM advisory: theta = atan(d/a), T_est = R*cot(theta)\n\n"
             "Top flexure is checked from continuous beam-strip negative support moment where interior pile lines exist; uplift and lateral effects are neglected.\n"
@@ -3377,6 +3437,9 @@ def render_design_summary(state: DesignState, results: Dict[str, Any]):
                 {"Item": "Top negative moment, Y strip", "Value": results["continuous_y"]["max_negative_kNm"], "Unit": "kN-m"},
                 {"Item": "Equivalent w, X strip", "Value": results["continuous_x"]["equivalent_w_kN_per_m"], "Unit": "kN/m"},
                 {"Item": "Equivalent w, Y strip", "Value": results["continuous_y"]["equivalent_w_kN_per_m"], "Unit": "kN/m"},
+                {"Item": "ACI 318-25 close-pile provision", "Value": "YES" if results["close_pile_spacing"]["applies"] else "NO", "Unit": ""},
+                {"Item": "Max nearest pile spacing", "Value": results["close_pile_spacing"]["max_nearest_spacing_mm"], "Unit": "mm"},
+                {"Item": "4D close-pile limit", "Value": results["close_pile_spacing"]["limit_mm"], "Unit": "mm"},
                 {"Item": "One-way φVc, section normal to Y", "Value": results["one_way_x"]["phiVc_kN"], "Unit": "kN"},
                 {"Item": "One-way φVc, section normal to X", "Value": results["one_way_y"]["phiVc_kN"], "Unit": "kN"},
                 {"Item": "One-way lambda_s, section normal to Y", "Value": results["one_way_x"]["lambda_s"],
@@ -3419,6 +3482,217 @@ def render_engineering_notes(results: Dict[str, Any]):
     st.markdown("#### Engineering advisories")
     for n in notes:
         st.markdown(f"- {n}")
+
+
+def render_calculation_steps(state: DesignState, results: Dict[str, Any]):
+    st.subheader("Step-by-Step Calculation")
+    st.caption("Steps are ordered to match the Strength / service check table. Values come from the latest DESIGN run.")
+
+    geom = state.geometry
+    mat = state.material
+    reinf = state.reinforcement
+    checks = results.get("checks", [])
+    pile_df = pile_group_result_table(state.piles, state.geometry)
+
+    def show_result(check: CheckResult):
+        ratio_text = "-" if not np.isfinite(check.ratio) else f"{check.ratio:.3f}"
+        st.markdown(
+            f"**Result:** Demand = `{fmt(check.demand, 2)} {check.unit}`, "
+            f"Capacity = `{fmt(check.capacity, 2)} {check.unit}`, "
+            f"D/C = `{ratio_text}`, Status = `{check.status}`"
+        )
+        if check.note:
+            st.info(check.note)
+
+    def show_points(points: List[str]):
+        for idx, point in enumerate(points, start=1):
+            st.markdown(f"{idx}. {point}")
+
+    st.markdown("### Common Inputs")
+    common = pd.DataFrame(
+        [
+            {"Item": "Load case", "Value": state.loadcase.name, "Unit": ""},
+            {"Item": "Pu total", "Value": results["Pu_total_kN"], "Unit": "kN"},
+            {"Item": "fc'", "Value": mat.fc_MPa, "Unit": "MPa"},
+            {"Item": "fy", "Value": mat.fy_MPa, "Unit": "MPa"},
+            {"Item": "phi flexure", "Value": mat.phi_flexure, "Unit": ""},
+            {"Item": "phi shear", "Value": mat.phi_shear, "Unit": ""},
+            {"Item": "Cap X", "Value": state.cap_length_x_mm, "Unit": "mm"},
+            {"Item": "Cap Y", "Value": state.cap_width_y_mm, "Unit": "mm"},
+            {"Item": "h", "Value": geom.cap_thickness_mm, "Unit": "mm"},
+            {"Item": "d bottom X", "Value": results["d_x_mm"], "Unit": "mm"},
+            {"Item": "d bottom Y", "Value": results["d_y_mm"], "Unit": "mm"},
+            {"Item": "d top X", "Value": results["d_top_x_mm"], "Unit": "mm"},
+            {"Item": "d top Y", "Value": results["d_top_y_mm"], "Unit": "mm"},
+            {"Item": "Close-pile max nearest spacing", "Value": results["close_pile_spacing"]["max_nearest_spacing_mm"], "Unit": "mm"},
+            {"Item": "Close-pile 4D limit", "Value": results["close_pile_spacing"]["limit_mm"], "Unit": "mm"},
+            {"Item": "ACI 318-25 close-pile provision", "Value": "YES" if results["close_pile_spacing"]["applies"] else "NO", "Unit": ""},
+        ]
+    )
+    st.dataframe(format_display_dataframe(common, {"Value": "{:,.3f}"}), use_container_width=True, hide_index=True)
+
+    with st.expander("Pile reaction distribution", expanded=False):
+        st.latex(r"R_i = \frac{P}{n} + \frac{M_x y_i}{\sum y^2} + \frac{M_y x_i}{\sum x^2}")
+        xs = np.array([mm_to_m(p.x_mm) for p in state.piles], dtype=float)
+        ys = np.array([mm_to_m(p.y_mm) for p in state.piles], dtype=float)
+        st.markdown(
+            f"`P = {state.loadcase.Pu_kN:.2f} kN`, `n = {len(state.piles)}`, "
+            f"`sum x² = {np.sum(xs ** 2):.4f} m²`, `sum y² = {np.sum(ys ** 2):.4f} m²`"
+        )
+        st.dataframe(format_display_dataframe(pile_df, {"R, compression + (kN)": "{:,.2f}", "x (mm)": "{:,.0f}", "y (mm)": "{:,.0f}"}), use_container_width=True, hide_index=True)
+
+    for check in checks:
+        with st.expander(check.name, expanded=False):
+            name = check.name.lower()
+
+            if check.name == "Pile compression":
+                st.latex(r"R_{max} \leq R_{allow,comp}")
+                show_points(
+                    [
+                        f"Find maximum compression pile reaction: Rmax = max(Ri) = {check.demand:.2f} kN.",
+                        f"Pile compression capacity = {check.capacity:.2f} kN.",
+                        f"D/C = {check.demand:.2f} / {check.capacity:.2f}.",
+                    ]
+                )
+                show_result(check)
+
+            elif check.name == "Pile tension/uplift":
+                st.latex(r"T_{max} = \max(-R_i, 0) \leq R_{allow,tension}")
+                show_points(
+                    [
+                        f"Find maximum uplift reaction: Tmax = {check.demand:.2f} kN.",
+                        f"Pile tension capacity = {check.capacity:.2f} kN.",
+                        f"D/C = {check.demand:.2f} / {check.capacity:.2f}.",
+                    ]
+                )
+                show_result(check)
+
+            elif "bottom x" in name:
+                sp = results["spacing_x"]
+                cap = results["cap_xbars"]
+                flex = results["flex_x"]
+                st.latex(r"M_u = \sum R_{ui} \, y_i")
+                st.latex(r"\phi M_n = \phi A_s f_y \left(d-\frac{a}{2}\right), \quad a=\frac{A_s f_y}{0.85 f'_c b}")
+                show_points(
+                    [
+                        f"Moment for bottom X bars from piles above/below loaded-area face: Mu = {check.demand:.2f} kN-m.",
+                        f"Provided steel from {reinf.main_bar_x} @ {sp['spacing_use_mm']:.0f} mm across width b = {state.cap_width_y_mm:.0f} mm: As = {sp['As_prov_mm2']:.0f} mm2.",
+                        f"a = As fy / (0.85 fc b) = {sp['As_prov_mm2']:.0f} x {mat.fy_MPa:.0f} / (0.85 x {mat.fc_MPa:.1f} x {state.cap_width_y_mm:.0f}) = {cap['a_mm']:.1f} mm.",
+                        f"phi Mn = {mat.phi_flexure:.2f} x As x fy x (d - a/2) = {check.capacity:.2f} kN-m.",
+                        f"Required As shown for reference = {flex['As_req_mm2']:.0f} mm2.",
+                    ]
+                )
+                show_result(check)
+
+            elif "bottom y" in name:
+                sp = results["spacing_y"]
+                cap = results["cap_ybars"]
+                flex = results["flex_y"]
+                st.latex(r"M_u = \sum R_{ui} \, x_i")
+                st.latex(r"\phi M_n = \phi A_s f_y \left(d-\frac{a}{2}\right), \quad a=\frac{A_s f_y}{0.85 f'_c b}")
+                show_points(
+                    [
+                        f"Moment for bottom Y bars from piles left/right of loaded-area face: Mu = {check.demand:.2f} kN-m.",
+                        f"Provided steel from {reinf.main_bar_y} @ {sp['spacing_use_mm']:.0f} mm across width b = {state.cap_length_x_mm:.0f} mm: As = {sp['As_prov_mm2']:.0f} mm2.",
+                        f"a = As fy / (0.85 fc b) = {sp['As_prov_mm2']:.0f} x {mat.fy_MPa:.0f} / (0.85 x {mat.fc_MPa:.1f} x {state.cap_length_x_mm:.0f}) = {cap['a_mm']:.1f} mm.",
+                        f"phi Mn = {mat.phi_flexure:.2f} x As x fy x (d - a/2) = {check.capacity:.2f} kN-m.",
+                        f"Required As shown for reference = {flex['As_req_mm2']:.0f} mm2.",
+                    ]
+                )
+                show_result(check)
+
+            elif "top x" in name:
+                sp = results["top_spacing_x"]
+                cap = results["top_cap_xbars"]
+                cont = results["continuous_x"]
+                st.latex(r"M^-_{u,top} = \max |M_{support}|")
+                st.latex(r"\phi M_n = \phi A_s f_y \left(d-\frac{a}{2}\right)")
+                show_points(
+                    [
+                        f"Continuous beam-strip supports in X direction = {cont['support_count']} pile lines at {cont['supports_mm']}.",
+                        f"Equivalent strip load w = {cont['equivalent_w_kN_per_m']:.2f} kN/m.",
+                        f"Maximum negative support moment M- = {cont['max_negative_kNm']:.2f} kN-m.",
+                        f"Provided top steel from {reinf.top_bar} @ {sp['spacing_use_mm']:.0f} mm: As = {sp['As_prov_mm2']:.0f} mm2.",
+                        f"phi Mn = {check.capacity:.2f} kN-m.",
+                    ]
+                )
+                show_result(check)
+
+            elif "top y" in name:
+                sp = results["top_spacing_y"]
+                cap = results["top_cap_ybars"]
+                cont = results["continuous_y"]
+                st.latex(r"M^-_{u,top} = \max |M_{support}|")
+                st.latex(r"\phi M_n = \phi A_s f_y \left(d-\frac{a}{2}\right)")
+                show_points(
+                    [
+                        f"Continuous beam-strip supports in Y direction = {cont['support_count']} pile lines at {cont['supports_mm']}.",
+                        f"Equivalent strip load w = {cont['equivalent_w_kN_per_m']:.2f} kN/m.",
+                        f"Maximum negative support moment M- = {cont['max_negative_kNm']:.2f} kN-m.",
+                        f"Provided top steel from {reinf.top_bar} @ {sp['spacing_use_mm']:.0f} mm: As = {sp['As_prov_mm2']:.0f} mm2.",
+                        f"phi Mn = {check.capacity:.2f} kN-m.",
+                    ]
+                )
+                show_result(check)
+
+            elif "one-way shear" in name:
+                is_y_section = "normal to y" in name
+                one_way = results["one_way_x"] if is_y_section else results["one_way_y"]
+                demand_key = "V_for_X_bars_direction_kN" if is_y_section else "V_for_Y_bars_direction_kN"
+                b = state.cap_length_x_mm if is_y_section else state.cap_width_y_mm
+                d = results["d_x_mm"] if is_y_section else results["d_y_mm"]
+                st.latex(r"V_u = \sum R_{ui,\ outside\ section}")
+                st.latex(r"\phi V_c = \phi v_c b d")
+                if one_way.get("use_close_pile_aci318_25"):
+                    st.latex(r"v_c = 0.17\lambda\sqrt{f'_c}\quad\text{(ACI 318-25 close-pile provision, SI)}")
+                else:
+                    st.latex(r"v_c = \min\left(0.66\lambda_s\lambda\rho_w^{1/3}\sqrt{f'_c}+\frac{N_u}{6A_g},\ 0.42\lambda\sqrt{f'_c}\right)")
+                show_points(
+                    [
+                        results["close_pile_spacing"]["note"],
+                        f"Critical section is at d from loaded-area face. Vu = {results['shear_demands'][demand_key]:.2f} kN.",
+                        f"Formula branch = {one_way['formula']}; lambda_s = {one_way['lambda_s']:.3f}; rho_w from provided bars = {one_way['rho_w']:.5f}.",
+                        f"vc refined = {one_way['vc_refined_MPa']:.3f} MPa; vc limit = {one_way['vc_limit_MPa']:.3f} MPa; vc used = {one_way['vc_MPa']:.3f} MPa.",
+                        f"phi Vc = {mat.phi_shear:.2f} x {one_way['vc_MPa']:.3f} x {b:.0f} x {d:.0f} / 1000 = {check.capacity:.2f} kN.",
+                    ]
+                )
+                show_result(check)
+
+            elif "punching" in name:
+                pdm = results["punch_demand"]
+                pc = results["punch_cap"]
+                st.latex(r"V_u = P_u - R_{inside}")
+                st.latex(r"\phi V_c = \phi v_c b_o d")
+                show_points(
+                    [
+                        results["close_pile_spacing"]["note"],
+                        f"Critical perimeter bo = {pdm['bo_mm']:.0f} mm.",
+                        f"lambda_s general = {pc['lambda_s_general']:.3f}; lambda_s used = {pc['lambda_s']:.3f}.",
+                        f"Pile reaction reduction factors: {pdm['pile_reduction_factors']}.",
+                        f"R_inside = {pdm['R_inside_kN']:.2f} kN; Pu total = {results['Pu_total_kN']:.2f} kN.",
+                        f"Vu = max(Pu - R_inside, 0) = {pdm['Vu_punch_kN']:.2f} kN.",
+                        f"vc governs by {pc['governing_equation']}; vc = {pc['vc_MPa']:.3f} MPa.",
+                        f"phi Vc = {mat.phi_shear:.2f} x {pc['vc_MPa']:.3f} x {pdm['bo_mm']:.0f} x {results['d_avg_mm']:.0f} / 1000 = {check.capacity:.2f} kN.",
+                    ]
+                )
+                show_result(check)
+
+            elif "bearing" in name:
+                loaded_bx = geom.pedestal_bx_mm if geom.use_pedestal_for_shear else geom.column_bx_mm
+                loaded_by = geom.pedestal_by_mm if geom.use_pedestal_for_shear else geom.column_by_mm
+                area = loaded_bx * loaded_by
+                st.latex(r"\phi P_n = \phi \, 0.85 f'_c A_1")
+                show_points(
+                    [
+                        f"Loaded area A1 = {loaded_bx:.0f} x {loaded_by:.0f} = {area:,.0f} mm2.",
+                        f"Demand Pu total = {check.demand:.2f} kN.",
+                        f"phi Pn = {mat.phi_bearing:.2f} x 0.85 x {mat.fc_MPa:.1f} x {area:,.0f} / 1000 = {check.capacity:.2f} kN.",
+                    ]
+                )
+                show_result(check)
+
+            else:
+                show_result(check)
 
 
 def render_code_basis():
@@ -3495,8 +3769,8 @@ def main():
     mat, geom, reinf, include_self_weight = sidebar_inputs()
     current_signature = None
 
-    tab_input, tab_results, tab_drawing, tab_stm, tab_report, tab_basis = st.tabs(
-        ["1 Input", "2 Design Results", "3 Drawing Output", "4 STM Advisory", "5 Report / Export", "6 Basis"]
+    tab_input, tab_results, tab_calc, tab_drawing, tab_stm, tab_report, tab_basis = st.tabs(
+        ["1 Input", "2 Design Results", "3 Calculation", "4 Drawing Output", "5 STM Advisory", "6 Report / Export", "7 Basis"]
     )
 
     with tab_input:
@@ -3608,6 +3882,8 @@ def main():
     if not isinstance(batch, dict) or not batch.get("items"):
         with tab_results:
             st.info("No design results yet. Go to Input and click DESIGN.")
+        with tab_calc:
+            st.info("No calculation steps yet. Go to Input and click DESIGN.")
         with tab_drawing:
             st.info("No drawing yet. Go to Input and click DESIGN.")
         with tab_stm:
@@ -3666,6 +3942,11 @@ def main():
             with c3:
                 st.markdown("##### Punching demand")
                 st.json({k: (round(v, 3) if isinstance(v, (int, float)) else v) for k, v in results["punch_demand"].items()})
+
+    with tab_calc:
+        if results_are_stale:
+            st.warning("Inputs have changed since the last DESIGN run. Click DESIGN again before using these calculation steps.")
+        render_calculation_steps(state, results)
 
     with tab_drawing:
         st.subheader("Drawing-style Output")
