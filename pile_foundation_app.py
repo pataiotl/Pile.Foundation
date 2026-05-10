@@ -1128,6 +1128,69 @@ def design_moments_from_pile_reactions(
     }
 
 
+def top_moments_from_tension_pile_reactions(
+    piles: List[PilePoint],
+    geom: Geometry,
+) -> Dict[str, float]:
+    """
+    Top flexural demand from actual net pile uplift/tension.
+
+    Compression-positive pile reactions push up on the cap and are handled by
+    the bottom cantilever moment check. Negative net reactions mean the pile is
+    in tension after axial force and biaxial moment have been combined. That
+    downward pull on the cap creates top tension at the loaded-area face, so top
+    bars are checked from net T_pile times lever arm.
+    """
+    loaded_bx = geom.pedestal_bx_mm if geom.use_pedestal_for_shear else geom.column_bx_mm
+    loaded_by = geom.pedestal_by_mm if geom.use_pedestal_for_shear else geom.column_by_mm
+
+    x_face = loaded_bx / 2.0
+    y_face = loaded_by / 2.0
+
+    tension_components = {p.label: max(-p.reaction_kN, 0.0) for p in piles}
+
+    M_right = sum(tension_components[p.label] * max(p.x_mm - x_face, 0.0) / 1000.0 for p in piles)
+    M_left = sum(tension_components[p.label] * max(-p.x_mm - x_face, 0.0) / 1000.0 for p in piles)
+    M_top = sum(tension_components[p.label] * max(p.y_mm - y_face, 0.0) / 1000.0 for p in piles)
+    M_bottom = sum(tension_components[p.label] * max(-p.y_mm - y_face, 0.0) / 1000.0 for p in piles)
+
+    return {
+        "M_right_for_Y_bars_kNm": M_right,
+        "M_left_for_Y_bars_kNm": M_left,
+        "M_top_for_X_bars_kNm": M_top,
+        "M_bottom_for_X_bars_kNm": M_bottom,
+        "M_for_Y_bars_kNm": max(M_right, M_left),
+        "M_for_X_bars_kNm": max(M_top, M_bottom),
+        "max_top_design_tension_component_kN": max(list(tension_components.values()) + [0.0]),
+        "tension_components_kN": tension_components,
+        "max_net_uplift_pile_kN": max([max(-p.reaction_kN, 0.0) for p in piles] + [0.0]),
+    }
+
+
+def governing_top_flexure_demand(
+    continuous: Dict[str, Any],
+    uplift_moment_kNm: float,
+) -> Dict[str, Any]:
+    continuous_moment = float(continuous.get("max_negative_kNm", 0.0))
+    demand = max(continuous_moment, uplift_moment_kNm)
+    if uplift_moment_kNm > continuous_moment + 1e-9:
+        source = "net_uplift_tension_pile"
+        note = "Top flexure governed by net pile tension/uplift force times lever arm to loaded-area face."
+    elif continuous_moment > 1e-9:
+        source = "continuous_negative_moment"
+        note = str(continuous.get("note", "Continuous beam-strip negative support moment."))
+    else:
+        source = "nominal"
+        note = str(continuous.get("note", "No top flexural demand from this load case."))
+    return {
+        "demand_kNm": demand,
+        "continuous_negative_kNm": continuous_moment,
+        "uplift_tension_kNm": uplift_moment_kNm,
+        "source": source,
+        "note": note,
+    }
+
+
 def continuous_beam_strip_moments(piles: List[PilePoint], axis: str) -> Dict[str, Any]:
     """
     Continuous beam-strip check over pile-line supports using matrix stiffness.
@@ -1456,6 +1519,9 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
     moment_demands = design_moments_from_pile_reactions(state.piles, geom, cap_x, cap_y)
     continuous_x = continuous_beam_strip_moments(state.piles, "x")
     continuous_y = continuous_beam_strip_moments(state.piles, "y")
+    top_uplift_moments = top_moments_from_tension_pile_reactions(state.piles, geom)
+    top_demand_x = governing_top_flexure_demand(continuous_x, top_uplift_moments["M_for_X_bars_kNm"])
+    top_demand_y = governing_top_flexure_demand(continuous_y, top_uplift_moments["M_for_Y_bars_kNm"])
     shear_demands = one_way_shear_demands(state.piles, geom, d_x, d_y)
     punch_demand = punching_shear_demand(state.piles, geom, d_avg, Pu_total)
 
@@ -1471,12 +1537,12 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
 
     zero_top_flex = {"As_req_mm2": 0.0, "As_strength_mm2": 0.0, "As_min_mm2": 0.0, "rho": 0.0, "a_mm": 0.0, "phiMn_kNm": 0.0}
     top_flex_x = (
-        flexural_As_required(continuous_x["max_negative_kNm"], cap_y, d_top_x, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure)
-        if continuous_x["max_negative_kNm"] > 1e-9 else dict(zero_top_flex)
+        flexural_As_required(top_demand_x["demand_kNm"], cap_y, d_top_x, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure)
+        if top_demand_x["demand_kNm"] > 1e-9 else dict(zero_top_flex)
     )
     top_flex_y = (
-        flexural_As_required(continuous_y["max_negative_kNm"], cap_x, d_top_y, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure)
-        if continuous_y["max_negative_kNm"] > 1e-9 else dict(zero_top_flex)
+        flexural_As_required(top_demand_y["demand_kNm"], cap_x, d_top_y, mat.fc_MPa, mat.fy_MPa, mat.phi_flexure)
+        if top_demand_y["demand_kNm"] > 1e-9 else dict(zero_top_flex)
     )
 
     sp_x = provided_spacing_As(reinf.main_bar_x, reinf.spacing_x_mm, cap_y)
@@ -1606,7 +1672,8 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
         ratio = demand / max(capacity, 1e-9)
         return CheckResult(name, demand, capacity, ratio, "kN", status_from_ratio(ratio), note)
 
-    def top_flexure_check(name: str, demand: float, capacity: float, direction_note: str) -> CheckResult:
+    def top_flexure_check(name: str, demand_info: Dict[str, Any], capacity: float, direction_note: str) -> CheckResult:
+        demand = float(demand_info.get("demand_kNm", 0.0))
         if demand <= 1e-9:
             return CheckResult(
                 name,
@@ -1615,9 +1682,14 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
                 np.nan,
                 "kN-m",
                 "NOMINAL",
-                direction_note + " No interior pile line in this beam-strip direction; top bars are nominal/detailing unless load reversal or pile-head fixity is added.",
+                direction_note + " No governing uplift pile tension or interior pile-line negative moment in this direction; top bars are nominal/detailing.",
             )
         ratio = demand / max(capacity, 1e-9)
+        source_note = (
+            "Net uplift/tension pile demand controls."
+            if demand_info.get("source") == "net_uplift_tension_pile"
+            else "Continuous beam-strip negative moment controls."
+        )
         return CheckResult(
             name,
             demand,
@@ -1625,7 +1697,7 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
             ratio,
             "kN-m",
             status_from_ratio(ratio),
-            direction_note + " Negative support moment from continuous beam-strip action; pile-head rotations are free.",
+            f"{direction_note} {source_note}",
         )
 
     checks.append(
@@ -1675,17 +1747,17 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
     checks.append(
         top_flexure_check(
             "Flexure - top X bars",
-            continuous_x["max_negative_kNm"],
+            top_demand_x,
             top_cap_xbars["phiMn_kNm"],
-            f"{continuous_x['note']}",
+            f"{top_demand_x['note']}",
         )
     )
     checks.append(
         top_flexure_check(
             "Flexure - top Y bars",
-            continuous_y["max_negative_kNm"],
+            top_demand_y,
             top_cap_ybars["phiMn_kNm"],
-            f"{continuous_y['note']}",
+            f"{top_demand_y['note']}",
         )
     )
     checks.append(
@@ -1753,6 +1825,9 @@ def design_all(state: DesignState, use_self_weight: bool = True) -> Dict[str, An
         "moment_demands": moment_demands,
         "continuous_x": continuous_x,
         "continuous_y": continuous_y,
+        "top_uplift_moments": top_uplift_moments,
+        "top_demand_x": top_demand_x,
+        "top_demand_y": top_demand_y,
         "close_pile_spacing": close_pile,
         "shear_demands": shear_demands,
         "punch_demand": punch_demand,
@@ -2308,8 +2383,8 @@ def envelope_group_design(
     overall = governing(lambda res, _state: max_check_ratio(res))
     flex_x_gov = governing(lambda res, _state: res["flex_x"]["As_req_mm2"])
     flex_y_gov = governing(lambda res, _state: res["flex_y"]["As_req_mm2"])
-    top_x_gov = governing(lambda res, _state: res["continuous_x"]["max_negative_kNm"] / max(res["top_cap_xbars"]["phiMn_kNm"], 1e-9))
-    top_y_gov = governing(lambda res, _state: res["continuous_y"]["max_negative_kNm"] / max(res["top_cap_ybars"]["phiMn_kNm"], 1e-9))
+    top_x_gov = governing(lambda res, _state: res["top_demand_x"]["demand_kNm"] / max(res["top_cap_xbars"]["phiMn_kNm"], 1e-9))
+    top_y_gov = governing(lambda res, _state: res["top_demand_y"]["demand_kNm"] / max(res["top_cap_ybars"]["phiMn_kNm"], 1e-9))
     punch_gov = governing(lambda res, _state: res["punch_demand"]["Vu_punch_kN"] / max(res["punch_cap"]["phiVc_kN"], 1e-9))
     shear_x_gov = governing(lambda res, _state: res["shear_demands"]["V_for_X_bars_direction_kN"] / max(res["one_way_x"]["phiVc_kN"], 1e-9))
     shear_y_gov = governing(lambda res, _state: res["shear_demands"]["V_for_Y_bars_direction_kN"] / max(res["one_way_y"]["phiVc_kN"], 1e-9))
@@ -2381,11 +2456,13 @@ def envelope_group_design(
         "Y bars governing combo": flex_y_gov["loadcase"],
         "Y bars As req (mm2)": flex_y_gov["results"]["flex_y"]["As_req_mm2"],
         "Top X governing combo": top_x_gov["loadcase"],
-        "Top X M- (kN-m)": top_x_gov["results"]["continuous_x"]["max_negative_kNm"],
-        "Top X D/C": top_x_gov["results"]["continuous_x"]["max_negative_kNm"] / max(top_x_gov["results"]["top_cap_xbars"]["phiMn_kNm"], 1e-9) if top_x_gov["results"]["continuous_x"]["max_negative_kNm"] > 1e-9 else np.nan,
+        "Top X M- (kN-m)": top_x_gov["results"]["top_demand_x"]["demand_kNm"],
+        "Top X source": top_x_gov["results"]["top_demand_x"]["source"],
+        "Top X D/C": top_x_gov["results"]["top_demand_x"]["demand_kNm"] / max(top_x_gov["results"]["top_cap_xbars"]["phiMn_kNm"], 1e-9) if top_x_gov["results"]["top_demand_x"]["demand_kNm"] > 1e-9 else np.nan,
         "Top Y governing combo": top_y_gov["loadcase"],
-        "Top Y M- (kN-m)": top_y_gov["results"]["continuous_y"]["max_negative_kNm"],
-        "Top Y D/C": top_y_gov["results"]["continuous_y"]["max_negative_kNm"] / max(top_y_gov["results"]["top_cap_ybars"]["phiMn_kNm"], 1e-9) if top_y_gov["results"]["continuous_y"]["max_negative_kNm"] > 1e-9 else np.nan,
+        "Top Y M- (kN-m)": top_y_gov["results"]["top_demand_y"]["demand_kNm"],
+        "Top Y source": top_y_gov["results"]["top_demand_y"]["source"],
+        "Top Y D/C": top_y_gov["results"]["top_demand_y"]["demand_kNm"] / max(top_y_gov["results"]["top_cap_ybars"]["phiMn_kNm"], 1e-9) if top_y_gov["results"]["top_demand_y"]["demand_kNm"] > 1e-9 else np.nan,
         "Punching governing combo": punch_gov["loadcase"],
         "Punching D/C": punch_gov["results"]["punch_demand"]["Vu_punch_kN"] / max(punch_gov["results"]["punch_cap"]["phiVc_kN"], 1e-9),
         "One-way X governing combo": shear_x_gov["loadcase"],
@@ -2396,9 +2473,9 @@ def envelope_group_design(
         display_results[key] = flex_x_gov["results"][key]
     for key in ["flex_y", "spacing_y", "cap_ybars"]:
         display_results[key] = flex_y_gov["results"][key]
-    for key in ["top_flex_x", "top_spacing_x", "top_cap_xbars", "d_top_x_mm", "ld_top_mm", "ld_top", "continuous_x"]:
+    for key in ["top_flex_x", "top_spacing_x", "top_cap_xbars", "d_top_x_mm", "ld_top_mm", "ld_top", "continuous_x", "top_uplift_moments", "top_demand_x"]:
         display_results[key] = top_x_gov["results"][key]
-    for key in ["top_flex_y", "top_spacing_y", "top_cap_ybars", "d_top_y_mm", "continuous_y"]:
+    for key in ["top_flex_y", "top_spacing_y", "top_cap_ybars", "d_top_y_mm", "continuous_y", "top_demand_y"]:
         display_results[key] = top_y_gov["results"][key]
     for key in ["punch_demand", "punch_cap"]:
         display_results[key] = punch_gov["results"][key]
@@ -2814,7 +2891,7 @@ def make_fallback_calculation_pdf(state: DesignState, results: Dict[str, Any]) -
             "R_i = P/n + Mx*y_i/sum(y^2) + My*x_i/sum(x^2)",
             "Flexure: phi As fy (d - a/2) >= Mu",
             "One-way and punching shear use the ACI 318-25 close-pile provision when the pile spacing check is satisfied.",
-            "Top flexure is checked from continuous beam-strip negative support moment where interior pile lines exist.",
+            "Top flexure is checked from the larger of net pile uplift/tension moment and continuous beam-strip negative support moment.",
             "Lateral load and torsion are flagged separately and need project-specific checks.",
         ]
     )
@@ -2898,7 +2975,7 @@ def make_calculation_pdf(state: DesignState, results: Dict[str, Any]) -> bytes:
             "Two-way punching: phi Vc = phi * min(vc_a, vc_b, vc_c) * bo * d using lambda_s, beta, and alpha_s terms; close-pile branch takes lambda_s = 1.0\n"
             "Punching demand: pile reactions near the critical perimeter are linearly proportioned over +/- pile radius\n"
             "STM advisory: theta = atan(d/a), T_est = R*cot(theta)\n\n"
-            "Top flexure is checked from continuous beam-strip negative support moment where interior pile lines exist; uplift and lateral effects are neglected.\n"
+            "Top flexure is checked from the larger of net pile uplift/tension moment and continuous beam-strip negative support moment. Lateral effects are neglected.\n"
             "Lateral load and torsion are flagged separately. Add project-specific lateral pile group and torsional checks before using those actions for final design."
         ),
     )
@@ -3385,7 +3462,7 @@ def render_design_summary(state: DesignState, results: Dict[str, Any]):
                     "Bars count": results["top_spacing_x"]["n_bars"],
                     "Provided As (mm²)": results["top_spacing_x"]["As_prov_mm2"],
                     "φMn (kN-m)": results["top_cap_xbars"]["phiMn_kNm"],
-                    "D/C": results["continuous_x"]["max_negative_kNm"] / max(results["top_cap_xbars"]["phiMn_kNm"], 1e-9) if results["continuous_x"]["max_negative_kNm"] > 1e-9 else np.nan,
+                    "D/C": results["top_demand_x"]["demand_kNm"] / max(results["top_cap_xbars"]["phiMn_kNm"], 1e-9) if results["top_demand_x"]["demand_kNm"] > 1e-9 else np.nan,
                 },
                 {
                     "Layer": "Top",
@@ -3398,7 +3475,7 @@ def render_design_summary(state: DesignState, results: Dict[str, Any]):
                     "Bars count": results["top_spacing_y"]["n_bars"],
                     "Provided As (mm²)": results["top_spacing_y"]["As_prov_mm2"],
                     "φMn (kN-m)": results["top_cap_ybars"]["phiMn_kNm"],
-                    "D/C": results["continuous_y"]["max_negative_kNm"] / max(results["top_cap_ybars"]["phiMn_kNm"], 1e-9) if results["continuous_y"]["max_negative_kNm"] > 1e-9 else np.nan,
+                    "D/C": results["top_demand_y"]["demand_kNm"] / max(results["top_cap_ybars"]["phiMn_kNm"], 1e-9) if results["top_demand_y"]["demand_kNm"] > 1e-9 else np.nan,
                 },
             ]
         )
@@ -3433,8 +3510,12 @@ def render_design_summary(state: DesignState, results: Dict[str, Any]):
                 {"Item": "Effective depth Y bars", "Value": results["d_y_mm"], "Unit": "mm"},
                 {"Item": "Effective depth top X bars", "Value": results["d_top_x_mm"], "Unit": "mm"},
                 {"Item": "Effective depth top Y bars", "Value": results["d_top_y_mm"], "Unit": "mm"},
-                {"Item": "Top negative moment, X strip", "Value": results["continuous_x"]["max_negative_kNm"], "Unit": "kN-m"},
-                {"Item": "Top negative moment, Y strip", "Value": results["continuous_y"]["max_negative_kNm"], "Unit": "kN-m"},
+                {"Item": "Top governing moment, X bars", "Value": results["top_demand_x"]["demand_kNm"], "Unit": "kN-m"},
+                {"Item": "Top governing moment, Y bars", "Value": results["top_demand_y"]["demand_kNm"], "Unit": "kN-m"},
+                {"Item": "Top net uplift moment, X bars", "Value": results["top_demand_x"]["uplift_tension_kNm"], "Unit": "kN-m"},
+                {"Item": "Top net uplift moment, Y bars", "Value": results["top_demand_y"]["uplift_tension_kNm"], "Unit": "kN-m"},
+                {"Item": "Top continuous M-, X strip", "Value": results["top_demand_x"]["continuous_negative_kNm"], "Unit": "kN-m"},
+                {"Item": "Top continuous M-, Y strip", "Value": results["top_demand_y"]["continuous_negative_kNm"], "Unit": "kN-m"},
                 {"Item": "Equivalent w, X strip", "Value": results["continuous_x"]["equivalent_w_kN_per_m"], "Unit": "kN/m"},
                 {"Item": "Equivalent w, Y strip", "Value": results["continuous_y"]["equivalent_w_kN_per_m"], "Unit": "kN/m"},
                 {"Item": "ACI 318-25 close-pile provision", "Value": "YES" if results["close_pile_spacing"]["applies"] else "NO", "Unit": ""},
@@ -3605,13 +3686,16 @@ def render_calculation_steps(state: DesignState, results: Dict[str, Any]):
                 sp = results["top_spacing_x"]
                 cap = results["top_cap_xbars"]
                 cont = results["continuous_x"]
-                st.latex(r"M^-_{u,top} = \max |M_{support}|")
+                demand_info = results["top_demand_x"]
+                st.latex(r"M_{u,top} = \max(M^-_{continuous}, \sum T_{pile} \ell)")
                 st.latex(r"\phi M_n = \phi A_s f_y \left(d-\frac{a}{2}\right)")
                 show_points(
                     [
                         f"Continuous beam-strip supports in X direction = {cont['support_count']} pile lines at {cont['supports_mm']}.",
                         f"Equivalent strip load w = {cont['equivalent_w_kN_per_m']:.2f} kN/m.",
-                        f"Maximum negative support moment M- = {cont['max_negative_kNm']:.2f} kN-m.",
+                        f"Continuous negative support moment M- = {demand_info['continuous_negative_kNm']:.2f} kN-m.",
+                        f"Net pile uplift/tension moment = {demand_info['uplift_tension_kNm']:.2f} kN-m.",
+                        f"Governing top moment = {demand_info['demand_kNm']:.2f} kN-m ({demand_info['source']}).",
                         f"Provided top steel from {reinf.top_bar} @ {sp['spacing_use_mm']:.0f} mm: As = {sp['As_prov_mm2']:.0f} mm2.",
                         f"phi Mn = {check.capacity:.2f} kN-m.",
                     ]
@@ -3622,13 +3706,16 @@ def render_calculation_steps(state: DesignState, results: Dict[str, Any]):
                 sp = results["top_spacing_y"]
                 cap = results["top_cap_ybars"]
                 cont = results["continuous_y"]
-                st.latex(r"M^-_{u,top} = \max |M_{support}|")
+                demand_info = results["top_demand_y"]
+                st.latex(r"M_{u,top} = \max(M^-_{continuous}, \sum T_{pile} \ell)")
                 st.latex(r"\phi M_n = \phi A_s f_y \left(d-\frac{a}{2}\right)")
                 show_points(
                     [
                         f"Continuous beam-strip supports in Y direction = {cont['support_count']} pile lines at {cont['supports_mm']}.",
                         f"Equivalent strip load w = {cont['equivalent_w_kN_per_m']:.2f} kN/m.",
-                        f"Maximum negative support moment M- = {cont['max_negative_kNm']:.2f} kN-m.",
+                        f"Continuous negative support moment M- = {demand_info['continuous_negative_kNm']:.2f} kN-m.",
+                        f"Net pile uplift/tension moment = {demand_info['uplift_tension_kNm']:.2f} kN-m.",
+                        f"Governing top moment = {demand_info['demand_kNm']:.2f} kN-m ({demand_info['source']}).",
                         f"Provided top steel from {reinf.top_bar} @ {sp['spacing_use_mm']:.0f} mm: As = {sp['As_prov_mm2']:.0f} mm2.",
                         f"phi Mn = {check.capacity:.2f} kN-m.",
                     ]
@@ -3707,7 +3794,7 @@ def render_code_basis():
         3. Concrete footing, bending, one-way shear, punching shear, bearing, and reinforcement use ultimate load combinations named CU-xx, or manual factored D/L.
         4. One-way shear at a distance d from the loaded area.
         5. Two-way punching shear at a perimeter d/2 from the loaded area.
-        6. Bottom flexural bars are checked from pile-cap cantilever bending demand; top flexural bars are checked from continuous beam-strip negative support moment where interior pile lines exist.
+        6. Bottom flexural bars are checked from compression-pile cantilever bending demand; top flexural bars are checked from the larger of net pile uplift/tension moment and continuous beam-strip negative support moment.
         7. Practical strut-and-tie advisory based on the load path from column/pedestal to pile heads.
         8. Drawing-style output for plan and elevation review.
 
@@ -3719,7 +3806,7 @@ def render_code_basis():
         - Punching demand includes cap self-weight with Pu as a conservative preliminary assumption; strictly, only the column load creates punching at the loaded-area perimeter.
         - One-way shear capacity uses the full rectangular cap width at the checked section; verify non-rectangular or highly irregular caps separately.
         - STM tie steel shown here is advisory; balanced components are halved to avoid double-counting symmetric opposite-side load paths, but a formal project STM may govern.
-        - Top flexure check uses vertical-support beam strips with free pile-head rotations; it neglects uplift, lateral force, torsion, and pile-head fixity moment.
+        - Top flexure check includes net pile tension/uplift as T times lever arm to the loaded-area face, plus vertical-support beam strips with free pile-head rotations; it neglects lateral force, torsion, and pile-head fixity moment.
         - Pile head fixity, pile tolerance, eccentricity, lateral load, settlement, and group effects.
         """
     )
