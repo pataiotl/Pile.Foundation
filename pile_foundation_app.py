@@ -561,6 +561,8 @@ def pile_group_result_table(piles: List[PilePoint], geom: Geometry) -> pd.DataFr
                 "x (mm)": p.x_mm,
                 "y (mm)": p.y_mm,
                 "R, compression + (kN)": p.reaction_kN,
+                "Compression demand (kN)": max(p.reaction_kN, 0.0),
+                "Uplift demand (kN)": tension,
                 "Compression ratio": comp_ratio,
                 "Tension ratio": tension_ratio,
                 "Status": status_badge("FAIL" if max(comp_ratio, tension_ratio) > 1.0 else "PASS"),
@@ -2423,15 +2425,12 @@ def envelope_group_design(
         )
 
     display_state = overall["state"]
-    comp_piles = []
-    for row in pile_rows:
-        comp_piles.append(PilePoint(row["Pile"], row["x (mm)"], row["y (mm)"], row["diameter_mm"], row["Max compression (kN)"]))
     display_state = DesignState(
         material=display_state.material,
         geometry=display_state.geometry,
         reinforcement=display_state.reinforcement,
         loadcase=LoadCase(name=f"{group_name} envelope", Pu_kN=display_state.loadcase.Pu_kN, Mux_kNm=display_state.loadcase.Mux_kNm, Muy_kNm=display_state.loadcase.Muy_kNm),
-        piles=comp_piles or display_state.piles,
+        piles=display_state.piles,
         cap_length_x_mm=display_state.cap_length_x_mm,
         cap_width_y_mm=display_state.cap_width_y_mm,
         effective_depth_x_mm=display_state.effective_depth_x_mm,
@@ -3128,32 +3127,42 @@ def load_input_ui(geom: Geometry) -> Dict[str, Any]:
                 st.session_state["manual_foundations_df"] = normalize_manual_service_load_columns(ensure_group_columns(saved_groups, geom))
             else:
                 st.session_state["manual_foundations_df"] = default_manual_foundations(geom)
+        if "manual_foundations_editor_version" not in st.session_state:
+            st.session_state["manual_foundations_editor_version"] = 0
         if st.button("APPLY geometry to table", key="apply_manual_sidebar_geometry", use_container_width=True):
             st.session_state["manual_foundations_df"] = normalize_manual_service_load_columns(
                 apply_sidebar_geometry_to_groups(st.session_state["manual_foundations_df"], geom)
             )
+            st.session_state["manual_foundations_editor_version"] += 1
             st.success("Sidebar pile/cap geometry applied to all foundation rows.")
         st.session_state["manual_foundations_df"] = normalize_manual_service_load_columns(st.session_state["manual_foundations_df"])
         for note in group_geometry_override_warnings(st.session_state["manual_foundations_df"], geom):
             st.warning(note)
-        manual_df = st.data_editor(
-            st.session_state["manual_foundations_df"],
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                **foundation_group_column_config(),
-                "D Ps (kN)": st.column_config.NumberColumn("Dead Ps (kN)", step=100.0),
-                "D Msx (kN-m)": st.column_config.NumberColumn("Dead Msx (kN-m)", step=50.0),
-                "D Msy (kN-m)": st.column_config.NumberColumn("Dead Msy (kN-m)", step=50.0),
-                "L Ps (kN)": st.column_config.NumberColumn("Live Ps (kN)", step=100.0),
-                "L Msx (kN-m)": st.column_config.NumberColumn("Live Msx (kN-m)", step=50.0),
-                "L Msy (kN-m)": st.column_config.NumberColumn("Live Msy (kN-m)", step=50.0),
-                "D Factor": st.column_config.NumberColumn("Dead factor", step=0.1),
-                "L Factor": st.column_config.NumberColumn("Live factor", step=0.1),
-            },
-        )
-        manual_df = normalize_manual_service_load_columns(ensure_group_columns(manual_df, geom))
-        st.session_state["manual_foundations_df"] = manual_df
+        with st.form("manual_foundations_edit_form"):
+            manual_df = st.data_editor(
+                st.session_state["manual_foundations_df"],
+                num_rows="dynamic",
+                use_container_width=True,
+                key=f"manual_foundations_editor_{st.session_state['manual_foundations_editor_version']}",
+                column_config={
+                    **foundation_group_column_config(),
+                    "D Ps (kN)": st.column_config.NumberColumn("Dead Ps (kN)", step=100.0),
+                    "D Msx (kN-m)": st.column_config.NumberColumn("Dead Msx (kN-m)", step=50.0),
+                    "D Msy (kN-m)": st.column_config.NumberColumn("Dead Msy (kN-m)", step=50.0),
+                    "L Ps (kN)": st.column_config.NumberColumn("Live Ps (kN)", step=100.0),
+                    "L Msx (kN-m)": st.column_config.NumberColumn("Live Msx (kN-m)", step=50.0),
+                    "L Msy (kN-m)": st.column_config.NumberColumn("Live Msy (kN-m)", step=50.0),
+                    "D Factor": st.column_config.NumberColumn("Dead factor", step=0.1),
+                    "L Factor": st.column_config.NumberColumn("Live factor", step=0.1),
+                },
+            )
+            apply_table_edits = st.form_submit_button("Apply table edits", use_container_width=True)
+        if apply_table_edits:
+            manual_df = normalize_manual_service_load_columns(ensure_group_columns(manual_df, geom))
+            st.session_state["manual_foundations_df"] = manual_df
+            st.session_state["manual_foundations_editor_version"] += 1
+            st.success("Manual table edits applied.")
+        manual_df = st.session_state["manual_foundations_df"]
         st.session_state["active_groups_df"] = manual_df
         return {
             "mode": "manual",
@@ -3620,7 +3629,20 @@ def render_calculation_steps(state: DesignState, results: Dict[str, Any]):
             f"`P = {state.loadcase.Pu_kN:.2f} kN`, `n = {len(state.piles)}`, "
             f"`sum x² = {np.sum(xs ** 2):.4f} m²`, `sum y² = {np.sum(ys ** 2):.4f} m²`"
         )
-        st.dataframe(format_display_dataframe(pile_df, {"R, compression + (kN)": "{:,.2f}", "x (mm)": "{:,.0f}", "y (mm)": "{:,.0f}"}), use_container_width=True, hide_index=True)
+        st.dataframe(
+            format_display_dataframe(
+                pile_df,
+                {
+                    "R, compression + (kN)": "{:,.2f}",
+                    "Compression demand (kN)": "{:,.2f}",
+                    "Uplift demand (kN)": "{:,.2f}",
+                    "x (mm)": "{:,.0f}",
+                    "y (mm)": "{:,.0f}",
+                },
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     for check in checks:
         with st.expander(check.name, expanded=False):
