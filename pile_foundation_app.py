@@ -639,6 +639,7 @@ def make_saved_state_xlsx(state: DesignState, results: Dict[str, Any], include_s
         if isinstance(batch, dict):
             batch.get("summary", pd.DataFrame()).to_excel(writer, sheet_name="design_results_summary", index=False)
             batch.get("pile_envelopes", pd.DataFrame()).to_excel(writer, sheet_name="pile_reaction_envelopes", index=False)
+            batch.get("rc_pile_envelopes", pd.DataFrame()).to_excel(writer, sheet_name="rc_pile_reaction_envelopes", index=False)
     return buf.getvalue()
 
 
@@ -2079,6 +2080,12 @@ def ensure_group_columns(df: pd.DataFrame, geom: Geometry) -> pd.DataFrame:
     for col, default in defaults.items():
         if col not in out.columns:
             out[col] = default
+    for col in ["Group Name", "Joint IDs"]:
+        out[col] = out[col].fillna("").astype(str)
+        out.loc[out[col].str.lower() == "nan", col] = ""
+    numeric_cols = [col for col, default in defaults.items() if isinstance(default, (int, float)) and col in out.columns]
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(defaults[col])
     return out[list(defaults.keys()) + [c for c in out.columns if c not in defaults]]
 
 
@@ -2221,6 +2228,7 @@ def sap_loadcases_from_rows(
     case_col = cmap.get("case")
     case_type_col = cmap.get("case_type")
     joint_col = cmap.get("joint")
+    step_col = cmap.get("step")
     value_cols = [vertical_col, mx_col, my_col, vx_col, vy_col, torsion_col]
     value_cols = [c for c in value_cols if c and c in df.columns]
     work = df.copy()
@@ -2238,6 +2246,8 @@ def sap_loadcases_from_rows(
         group_cols.append(case_col)
     if case_type_col and case_type_col in work.columns:
         group_cols.append(case_type_col)
+    if step_col and step_col in work.columns:
+        group_cols.append(step_col)
     grouped = work.groupby(group_cols, dropna=False)[value_cols].sum().reset_index() if group_cols else work
 
     out = []
@@ -2247,6 +2257,10 @@ def sap_loadcases_from_rows(
             parts.append(f"J{str(row.get(joint_col)).strip()}")
         if case_col and case_col in grouped.columns:
             parts.append(str(row.get(case_col)).strip())
+        if step_col and step_col in grouped.columns:
+            step_value = str(row.get(step_col)).strip()
+            if step_value and step_value.lower() != "nan":
+                parts.append(step_value)
         if not parts:
             parts.append(f"SAP row {idx}")
         case_name = " - ".join(parts)
@@ -2358,7 +2372,7 @@ def envelope_group_design(
 ) -> Dict[str, Any]:
     service_cases = service_loadcases if service_loadcases is not None else [lc for lc in loadcases if is_service_loadcase(lc)]
     ultimate_cases = ultimate_loadcases if ultimate_loadcases is not None else [lc for lc in loadcases if is_ultimate_loadcase(lc)]
-    if not service_cases:
+    if service_loadcases is None and not service_cases:
         service_cases = loadcases
     if not ultimate_cases:
         ultimate_cases = loadcases
@@ -2423,6 +2437,58 @@ def envelope_group_design(
                 "diameter_mm": dia,
             }
         )
+
+    rc_pile_rows = []
+    for label in labels:
+        vals = []
+        coords = None
+        dia = geom.pile_diameter_mm
+        for run in rc_runs:
+            pile = next((p for p in run["state"].piles if p.label == label), None)
+            if pile is None:
+                continue
+            vals.append((pile.reaction_kN, run["loadcase"]))
+            coords = (pile.x_mm, pile.y_mm)
+            dia = pile.diameter_mm
+        if not vals:
+            continue
+        comp = max(vals, key=lambda item: item[0])
+        ten = min(vals, key=lambda item: item[0])
+        rc_pile_rows.append(
+            {
+                "Group": group_name,
+                "Pile": label,
+                "x (mm)": coords[0] if coords else 0.0,
+                "y (mm)": coords[1] if coords else 0.0,
+                "Max compression (kN)": max(comp[0], 0.0),
+                "Compression combo": comp[1],
+                "Max uplift (kN)": max(-ten[0], 0.0),
+                "Uplift combo": ten[1],
+                "diameter_mm": dia,
+            }
+        )
+
+    def pile_reactions_by_combo_rows(runs: List[Dict[str, Any]], phase: str) -> List[Dict[str, Any]]:
+        rows = []
+        for run in runs:
+            for pile in run["state"].piles:
+                rows.append(
+                    {
+                        "Group": group_name,
+                        "Design phase": phase,
+                        "Combo": run["loadcase"],
+                        "Pile": pile.label,
+                        "x (mm)": pile.x_mm,
+                        "y (mm)": pile.y_mm,
+                        "R, compression + (kN)": pile.reaction_kN,
+                        "Compression demand (kN)": max(pile.reaction_kN, 0.0),
+                        "Uplift demand (kN)": max(-pile.reaction_kN, 0.0),
+                    }
+                )
+        return rows
+
+    service_reaction_rows = pile_reactions_by_combo_rows(service_runs, "Pile capacity")
+    rc_reaction_rows = pile_reactions_by_combo_rows(rc_runs, "RC design")
 
     display_state = overall["state"]
     display_state = DesignState(
@@ -2493,6 +2559,10 @@ def envelope_group_design(
         "punching_ultimate": punch_gov["loadcase"],
         "one_way_x_ultimate": shear_x_gov["loadcase"],
         "one_way_y_ultimate": shear_y_gov["loadcase"],
+        "pile_compression_envelope": max(pile_rows, key=lambda row: row["Max compression (kN)"])["Compression combo"] if pile_rows else "-",
+        "pile_uplift_envelope": max(pile_rows, key=lambda row: row["Max uplift (kN)"])["Uplift combo"] if pile_rows else "-",
+        "rc_pile_compression_envelope": max(rc_pile_rows, key=lambda row: row["Max compression (kN)"])["Compression combo"] if rc_pile_rows else "-",
+        "rc_pile_uplift_envelope": max(rc_pile_rows, key=lambda row: row["Max uplift (kN)"])["Uplift combo"] if rc_pile_rows else "-",
     }
     max_comp = max([row["Max compression (kN)"] for row in pile_rows] + [0.0])
     max_uplift = max([row["Max uplift (kN)"] for row in pile_rows] + [0.0])
@@ -2506,7 +2576,13 @@ def envelope_group_design(
             envelope_checks.append(CheckResult(check.name, max_uplift, geom.pile_capacity_tension_kN, ratio, "kN", status_from_ratio(ratio), "Envelope maximum uplift pile reaction."))
         else:
             envelope_checks.append(check)
+    pile_envelope_df = pd.DataFrame(pile_rows)
+    rc_pile_envelope_df = pd.DataFrame(rc_pile_rows)
     display_results["checks"] = envelope_checks
+    display_results["pile_reaction_envelope"] = pile_envelope_df
+    display_results["rc_pile_reaction_envelope"] = rc_pile_envelope_df
+    display_results["pile_reactions_by_combo"] = pd.DataFrame(service_reaction_rows)
+    display_results["rc_pile_reactions_by_combo"] = pd.DataFrame(rc_reaction_rows)
     return {
         "group": group_name,
         "runs": rc_runs,
@@ -2515,7 +2591,8 @@ def envelope_group_design(
         "state": display_state,
         "results": display_results,
         "summary": summary,
-        "pile_envelope": pd.DataFrame(pile_rows),
+        "pile_envelope": pile_envelope_df,
+        "rc_pile_envelope": rc_pile_envelope_df,
     }
 
 
@@ -2876,8 +2953,17 @@ def make_fallback_calculation_pdf(state: DesignState, results: Dict[str, Any]) -
     for check in results["checks"]:
         lines.append(f"{check.name}: D={fmt(check.demand, 2)} {check.unit}, C={fmt(check.capacity, 2)}, Ratio={fmt(check.ratio, 3)}, {check.status}")
     lines.extend(["", "Pile Reactions"])
-    for pile in state.piles:
-        lines.append(f"{pile.label}: x={pile.x_mm:.0f} mm, y={pile.y_mm:.0f} mm, R={pile.reaction_kN:.2f} kN")
+    pile_env_df = results.get("pile_reaction_envelope")
+    if isinstance(pile_env_df, pd.DataFrame) and not pile_env_df.empty:
+        for _, row in pile_env_df.iterrows():
+            lines.append(
+                f"{row.get('Pile')}: comp={fmt(safe_float(row.get('Max compression (kN)')), 1)} kN, "
+                f"uplift={fmt(safe_float(row.get('Max uplift (kN)')), 1)} kN, "
+                f"D/C={fmt(max(safe_float(row.get('Compression ratio')), safe_float(row.get('Tension ratio'))), 3)}"
+            )
+    else:
+        for pile in state.piles:
+            lines.append(f"{pile.label}: x={pile.x_mm:.0f} mm, y={pile.y_mm:.0f} mm, R={pile.reaction_kN:.2f} kN")
     lines.extend(
         [
             "",
@@ -2885,13 +2971,6 @@ def make_fallback_calculation_pdf(state: DesignState, results: Dict[str, Any]) -
             f"X bars: {state.reinforcement.main_bar_x} @ {results['spacing_x']['spacing_use_mm']:.0f} mm, As req {results['flex_x']['As_req_mm2']:.0f} mm2",
             f"Y bars: {state.reinforcement.main_bar_y} @ {results['spacing_y']['spacing_use_mm']:.0f} mm, As req {results['flex_y']['As_req_mm2']:.0f} mm2",
             f"Top X/Y bars: {state.reinforcement.top_bar} @ {results['top_spacing_x']['spacing_use_mm']:.0f} mm, As req X/Y {results['top_flex_x']['As_req_mm2']:.0f}/{results['top_flex_y']['As_req_mm2']:.0f} mm2",
-            "",
-            "Formula Notes",
-            "R_i = P/n + Mx*y_i/sum(y^2) + My*x_i/sum(x^2)",
-            "Flexure: phi As fy (d - a/2) >= Mu",
-            "One-way and punching shear use the ACI 318-25 close-pile provision when the pile spacing check is satisfied.",
-            "Top flexure is checked from the larger of net pile uplift/tension moment and continuous beam-strip negative support moment.",
-            "Lateral load and torsion are flagged separately and need project-specific checks.",
         ]
     )
     return make_simple_pdf(lines)
@@ -2902,16 +2981,17 @@ def make_calculation_pdf(state: DesignState, results: Dict[str, Any]) -> bytes:
         return make_fallback_calculation_pdf(state, results)
 
     pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=14)
+    pdf.set_auto_page_break(auto=True, margin=8)
+    pdf.set_margins(10, 8, 10)
     pdf.add_page()
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 9, pdf_safe(APP_TITLE), ln=True)
-    pdf.set_font("Arial", "", 9)
-    pdf.multi_cell(0, 5, pdf_safe("Calculation report - preliminary ACI-style pile-cap design aid. Verify final design against governing code, geotechnical report, and project specifications."))
-    pdf.ln(2)
+    pdf.set_font("Arial", "B", 13)
+    pdf.cell(0, 6, pdf_safe(APP_TITLE), ln=True)
+    pdf.set_font("Arial", "", 8)
+    pdf.cell(0, 4, pdf_safe("Calculation summary - verify final design against governing code, geotechnical report, and project specifications."), ln=True)
+    pdf.ln(1)
 
     pdf.set_font("Arial", "B", 11)
-    pdf.cell(0, 7, "Input Summary", ln=True)
+    pdf.cell(0, 5, "Input Summary", ln=True)
     pdf_add_table(
         pdf,
         pd.DataFrame(
@@ -2933,22 +3013,35 @@ def make_calculation_pdf(state: DesignState, results: Dict[str, Any]) -> bytes:
         ["Item", "Value", "Unit"],
         [55, 85, 30],
     )
-    pdf.ln(3)
+    pdf.ln(1)
 
     pdf.set_font("Arial", "B", 11)
-    pdf.cell(0, 7, "Design Checks", ln=True)
+    pdf.cell(0, 5, "Design Checks", ln=True)
     checks_df = checks_to_dataframe(results["checks"])
     pdf_add_table(pdf, checks_df, ["Check", "Demand", "Capacity", "Ratio", "Status"], [58, 30, 30, 25, 25])
-    pdf.ln(3)
+    pdf.ln(1)
 
     pdf.set_font("Arial", "B", 11)
-    pdf.cell(0, 7, "Pile Reactions", ln=True)
-    pile_df = pile_group_result_table(state.piles, state.geometry)
-    pdf_add_table(pdf, pile_df, ["Pile", "x (mm)", "y (mm)", "R, compression + (kN)", "Status"], [22, 28, 28, 55, 35])
-    pdf.ln(3)
+    pdf.cell(0, 5, "Pile Reactions - CS Service Envelope", ln=True)
+    pile_env_df = results.get("pile_reaction_envelope")
+    if isinstance(pile_env_df, pd.DataFrame) and not pile_env_df.empty:
+        pile_df = pile_env_df.copy()
+        pile_df["Status"] = pile_df.apply(
+            lambda row: "FAIL" if max(safe_float(row.get("Compression ratio")), safe_float(row.get("Tension ratio"))) > 1.0 else "PASS",
+            axis=1,
+        )
+        pdf_add_table(pdf, pile_df, ["Pile", "x (mm)", "y (mm)", "Max compression (kN)", "Max uplift (kN)", "Status"], [16, 23, 23, 43, 35, 24])
+    else:
+        pile_df = pile_group_result_table(state.piles, state.geometry)
+        pile_df["Status"] = pile_df.apply(
+            lambda row: "FAIL" if max(safe_float(row.get("Compression ratio")), safe_float(row.get("Tension ratio"))) > 1.0 else "PASS",
+            axis=1,
+        )
+        pdf_add_table(pdf, pile_df, ["Pile", "x (mm)", "y (mm)", "R, compression + (kN)", "Status"], [22, 28, 28, 55, 35])
+    pdf.ln(1)
 
     pdf.set_font("Arial", "B", 11)
-    pdf.cell(0, 7, "Reinforcement Summary", ln=True)
+    pdf.cell(0, 5, "Reinforcement Summary", ln=True)
     reinf_df = pd.DataFrame(
         [
             {"Direction": "Bottom X bars", "Bar": state.reinforcement.main_bar_x, "As req": results["flex_x"]["As_req_mm2"], "Use spacing": results["spacing_x"]["spacing_use_mm"], "As prov": results["spacing_x"]["As_prov_mm2"], "phiMn": results["cap_xbars"]["phiMn_kNm"]},
@@ -2958,26 +3051,6 @@ def make_calculation_pdf(state: DesignState, results: Dict[str, Any]) -> bytes:
         ]
     )
     pdf_add_table(pdf, reinf_df, ["Direction", "Bar", "As req", "Use spacing", "As prov", "phiMn"], [30, 22, 28, 30, 28, 28])
-
-    pdf.add_page()
-    pdf.set_font("Arial", "B", 11)
-    pdf.cell(0, 7, "Formula Notes", ln=True)
-    pdf.set_font("Arial", "", 9)
-    pdf.multi_cell(
-        0,
-        5,
-        pdf_safe(
-            "Pile reaction: R_i = P/n + Mx*y_i/sum(y^2) + My*x_i/sum(x^2)\n"
-            "Flexure: phi * As * fy * (d - a/2) >= Mu; a = As*fy/(0.85*fc'*b)\n"
-            "One-way shear: general branch uses phi Vc = phi * [0.66*lambda_s*lambda*rho_w^(1/3)*sqrt(fc') + Nu/(6Ag)] * b * d, capped by vc <= 0.42*lambda*sqrt(fc')\n"
-            "ACI 318-25 close-pile branch: pile caps with spacing <= 4D use vc = 0.17*lambda*sqrt(fc') in SI units for one-way shear\n"
-            "Two-way punching: phi Vc = phi * min(vc_a, vc_b, vc_c) * bo * d using lambda_s, beta, and alpha_s terms; close-pile branch takes lambda_s = 1.0\n"
-            "Punching demand: pile reactions near the critical perimeter are linearly proportioned over +/- pile radius\n"
-            "STM advisory: theta = atan(d/a), T_est = R*cot(theta)\n\n"
-            "Top flexure is checked from the larger of net pile uplift/tension moment and continuous beam-strip negative support moment. Lateral effects are neglected.\n"
-            "Lateral load and torsion are flagged separately. Add project-specific lateral pile group and torsional checks before using those actions for final design."
-        ),
-    )
     data = pdf.output(dest="S")
     if isinstance(data, str):
         return data.encode("latin-1")
@@ -3276,7 +3349,7 @@ def load_input_ui(geom: Geometry) -> Dict[str, Any]:
         moment_sign=float(moment_sign),
     )
     st.success(f"Ready to design {len(groups)} group(s). SAP rows will be enveloped by Joint + OutputCase, not summed across joints.")
-    st.info("Design phases: pile/geotechnical checks use service combinations named CS-xx; concrete, bending, shear, and reinforcement use ultimate combinations named CU-xx.")
+    st.info("Design phases: pile/geotechnical checks use service combinations named CS-xx after P+M reaction distribution; concrete, bending, shear, and reinforcement use ultimate combinations named CU-xx when available.")
     return {
         "mode": "sap",
         "loadcases": all_loadcases or [LoadCase()],
@@ -3583,6 +3656,30 @@ def render_calculation_steps(state: DesignState, results: Dict[str, Any]):
     reinf = state.reinforcement
     checks = results.get("checks", [])
     pile_df = pile_group_result_table(state.piles, state.geometry)
+    pile_env_df = results.get("pile_reaction_envelope")
+    if isinstance(pile_env_df, pd.DataFrame) and not pile_env_df.empty:
+        pile_df = pile_env_df.copy()
+        pile_df["No. Piles"] = geom.n_piles
+        pile_df["Compression demand (kN)"] = pile_df["Max compression (kN)"]
+        pile_df["Uplift demand (kN)"] = pile_df["Max uplift (kN)"]
+        pile_df["R, compression + (kN)"] = pile_df["Compression demand (kN)"]
+        pile_df["Status"] = pile_df.apply(
+            lambda row: status_badge("FAIL" if max(safe_float(row.get("Compression ratio")), safe_float(row.get("Tension ratio"))) > 1.0 else "PASS"),
+            axis=1,
+        )
+        pile_df = pile_df[
+            [
+                "Pile",
+                "No. Piles",
+                "x (mm)",
+                "y (mm)",
+                "Compression demand (kN)",
+                "Uplift demand (kN)",
+                "Compression ratio",
+                "Tension ratio",
+                "Status",
+            ]
+        ]
 
     def show_result(check: CheckResult):
         ratio_text = "-" if not np.isfinite(check.ratio) else f"{check.ratio:.3f}"
@@ -3626,9 +3723,11 @@ def render_calculation_steps(state: DesignState, results: Dict[str, Any]):
         xs = np.array([mm_to_m(p.x_mm) for p in state.piles], dtype=float)
         ys = np.array([mm_to_m(p.y_mm) for p in state.piles], dtype=float)
         st.markdown(
-            f"`P = {state.loadcase.Pu_kN:.2f} kN`, `n = {len(state.piles)}`, "
+            f"`n = {len(state.piles)}`, "
             f"`sum x² = {np.sum(xs ** 2):.4f} m²`, `sum y² = {np.sum(ys ** 2):.4f} m²`"
         )
+        if isinstance(pile_env_df, pd.DataFrame) and not pile_env_df.empty:
+            st.caption("Pile capacity status below uses the CS service envelope, not the RC governing CU snapshot.")
         st.dataframe(
             format_display_dataframe(
                 pile_df,
@@ -3643,6 +3742,74 @@ def render_calculation_steps(state: DesignState, results: Dict[str, Any]):
             use_container_width=True,
             hide_index=True,
         )
+        pile_by_combo_df = results.get("pile_reactions_by_combo")
+        if isinstance(pile_by_combo_df, pd.DataFrame) and not pile_by_combo_df.empty:
+            st.markdown("##### Service pile reactions by SAP combination")
+            st.dataframe(
+                format_display_dataframe(
+                    pile_by_combo_df,
+                    {
+                        "x (mm)": "{:,.0f}",
+                        "y (mm)": "{:,.0f}",
+                        "R, compression + (kN)": "{:,.2f}",
+                        "Compression demand (kN)": "{:,.2f}",
+                        "Uplift demand (kN)": "{:,.2f}",
+                    },
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        pile_env_df = results.get("pile_reaction_envelope")
+        if isinstance(pile_env_df, pd.DataFrame) and not pile_env_df.empty:
+            st.markdown("##### Service per-pile envelope for pile capacity checks")
+            st.dataframe(
+                format_display_dataframe(
+                    pile_env_df,
+                    {
+                        "x (mm)": "{:,.0f}",
+                        "y (mm)": "{:,.0f}",
+                        "Max compression (kN)": "{:,.2f}",
+                        "Max uplift (kN)": "{:,.2f}",
+                        "Compression ratio": "{:.3f}",
+                        "Tension ratio": "{:.3f}",
+                    },
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        rc_pile_env_df = results.get("rc_pile_reaction_envelope")
+        rc_pile_by_combo_df = results.get("rc_pile_reactions_by_combo")
+        if isinstance(rc_pile_by_combo_df, pd.DataFrame) and not rc_pile_by_combo_df.empty:
+            st.markdown("##### Ultimate pile reactions by SAP combination for RC design")
+            st.dataframe(
+                format_display_dataframe(
+                    rc_pile_by_combo_df,
+                    {
+                        "x (mm)": "{:,.0f}",
+                        "y (mm)": "{:,.0f}",
+                        "R, compression + (kN)": "{:,.2f}",
+                        "Compression demand (kN)": "{:,.2f}",
+                        "Uplift demand (kN)": "{:,.2f}",
+                    },
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        if isinstance(rc_pile_env_df, pd.DataFrame) and not rc_pile_env_df.empty:
+            st.markdown("##### Ultimate per-pile envelope for RC design context")
+            st.dataframe(
+                format_display_dataframe(
+                    rc_pile_env_df,
+                    {
+                        "x (mm)": "{:,.0f}",
+                        "y (mm)": "{:,.0f}",
+                        "Max compression (kN)": "{:,.2f}",
+                        "Max uplift (kN)": "{:,.2f}",
+                    },
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     for check in checks:
         with st.expander(check.name, expanded=False):
@@ -3907,6 +4074,7 @@ def main():
             batch_items = []
             summary_rows = []
             pile_env_frames = []
+            rc_pile_env_frames = []
             sap_df = load_input.get("sap_df", pd.DataFrame())
             cmap = load_input.get("cmap", {})
             joint_col = cmap.get("joint") if isinstance(cmap, dict) else None
@@ -3933,6 +4101,9 @@ def main():
                         load_input["moment_sign"],
                         group_name=group_name,
                     )
+                    # For pile capacity, use service SAP combinations only.
+                    # Each CS combo is still checked one-by-one as P + M before
+                    # the per-pile compression/uplift envelope is taken.
                     service_cases = [lc for lc in loadcases if is_service_loadcase(lc)]
                     ultimate_cases = [lc for lc in loadcases if is_ultimate_loadcase(lc)]
                     item = envelope_group_design(
@@ -3949,6 +4120,7 @@ def main():
                     batch_items.append(item)
                     summary_rows.append(item["summary"])
                     pile_env_frames.append(item["pile_envelope"])
+                    rc_pile_env_frames.append(item["rc_pile_envelope"])
             else:
                 for _, group_row in groups_df.iterrows():
                     group_name = str(group_row.get("Group Name", "") or "Manual Foundation").strip()
@@ -3969,10 +4141,27 @@ def main():
                     batch_items.append(item)
                     summary_rows.append(item["summary"])
                     pile_env_frames.append(item["pile_envelope"])
+                    rc_pile_env_frames.append(item["rc_pile_envelope"])
 
             summary_df = pd.DataFrame(summary_rows)
             pile_env_df = pd.concat(pile_env_frames, ignore_index=True) if pile_env_frames else pd.DataFrame()
-            st.session_state["batch_design"] = {"items": batch_items, "summary": summary_df, "pile_envelopes": pile_env_df}
+            rc_pile_env_df = pd.concat(rc_pile_env_frames, ignore_index=True) if rc_pile_env_frames else pd.DataFrame()
+            pile_reactions_df = pd.concat(
+                [item["results"].get("pile_reactions_by_combo", pd.DataFrame()) for item in batch_items],
+                ignore_index=True,
+            ) if batch_items else pd.DataFrame()
+            rc_pile_reactions_df = pd.concat(
+                [item["results"].get("rc_pile_reactions_by_combo", pd.DataFrame()) for item in batch_items],
+                ignore_index=True,
+            ) if batch_items else pd.DataFrame()
+            st.session_state["batch_design"] = {
+                "items": batch_items,
+                "summary": summary_df,
+                "pile_envelopes": pile_env_df,
+                "rc_pile_envelopes": rc_pile_env_df,
+                "pile_reactions_by_combo": pile_reactions_df,
+                "rc_pile_reactions_by_combo": rc_pile_reactions_df,
+            }
             st.session_state["design_input_signature"] = current_signature
             st.session_state["selected_design_group"] = batch_items[0]["group"] if batch_items else ""
             st.success(f"Design complete for {len(batch_items)} group(s).")
@@ -3982,8 +4171,11 @@ def main():
             st.markdown("#### Latest design run")
             st.dataframe(style_dc_columns(batch["summary"]), use_container_width=True, hide_index=True)
             if not batch.get("pile_envelopes", pd.DataFrame()).empty:
-                st.markdown("#### Pile reaction envelopes")
+                st.markdown("#### Service pile reaction envelopes")
                 st.dataframe(style_dc_columns(batch["pile_envelopes"]), use_container_width=True, hide_index=True)
+            if not batch.get("rc_pile_envelopes", pd.DataFrame()).empty:
+                st.markdown("#### Ultimate pile reaction envelopes for RC design")
+                st.dataframe(style_dc_columns(batch["rc_pile_envelopes"]), use_container_width=True, hide_index=True)
         else:
             st.info("Prepare inputs and click DESIGN to generate results.")
 
@@ -4001,7 +4193,7 @@ def main():
             st.info("No export yet. Go to Input and click DESIGN.")
         with tab_basis:
             render_code_basis()
-        st.stop()
+        return
 
     groups_available = [item["group"] for item in batch["items"]]
     selected_group = st.sidebar.selectbox(
@@ -4184,11 +4376,18 @@ def main():
         batch = st.session_state.get("batch_design")
         if isinstance(batch, dict):
             st.markdown("#### Batch design exports")
-            b1, b2 = st.columns(2)
+            b1, b2, b3 = st.columns(3)
             with b1:
                 dataframe_download_button(batch.get("summary", pd.DataFrame()), "Download group summary CSV", "pile_cap_group_summary.csv")
             with b2:
-                dataframe_download_button(batch.get("pile_envelopes", pd.DataFrame()), "Download pile envelopes CSV", "pile_reaction_envelopes.csv")
+                dataframe_download_button(batch.get("pile_envelopes", pd.DataFrame()), "Download service pile envelopes CSV", "pile_reaction_envelopes.csv")
+            with b3:
+                dataframe_download_button(batch.get("rc_pile_envelopes", pd.DataFrame()), "Download ultimate pile envelopes CSV", "rc_pile_reaction_envelopes.csv")
+            b4, b5 = st.columns(2)
+            with b4:
+                dataframe_download_button(batch.get("pile_reactions_by_combo", pd.DataFrame()), "Download service reactions by combo CSV", "pile_reactions_by_combo.csv")
+            with b5:
+                dataframe_download_button(batch.get("rc_pile_reactions_by_combo", pd.DataFrame()), "Download ultimate reactions by combo CSV", "rc_pile_reactions_by_combo.csv")
 
         with st.expander("Preview Markdown report", expanded=False):
             st.markdown(report_md)
